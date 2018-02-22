@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
@@ -123,7 +137,7 @@ func TestAddressString(t *testing.T) {
 func TestInspectServerBlocksWithCustomDefaultPort(t *testing.T) {
 	Port = "9999"
 	filename := "Testfile"
-	ctx := newContext().(*httpContext)
+	ctx := newContext(&caddy.Instance{Storage: make(map[interface{}]interface{})}).(*httpContext)
 	input := strings.NewReader(`localhost`)
 	sblocks, err := caddyfile.Parse(filename, input, nil)
 	if err != nil {
@@ -139,9 +153,26 @@ func TestInspectServerBlocksWithCustomDefaultPort(t *testing.T) {
 	}
 }
 
+// See discussion on PR #2015
+func TestInspectServerBlocksWithAdjustedAddress(t *testing.T) {
+	Port = DefaultPort
+	Host = "example.com"
+	filename := "Testfile"
+	ctx := newContext(&caddy.Instance{Storage: make(map[interface{}]interface{})}).(*httpContext)
+	input := strings.NewReader("example.com {\n}\n:2015 {\n}")
+	sblocks, err := caddyfile.Parse(filename, input, nil)
+	if err != nil {
+		t.Fatalf("Expected no error setting up test, got: %v", err)
+	}
+	_, err = ctx.InspectServerBlocks(filename, sblocks)
+	if err == nil {
+		t.Fatalf("Expected an error because site definitions should overlap, got: %v", err)
+	}
+}
+
 func TestInspectServerBlocksCaseInsensitiveKey(t *testing.T) {
 	filename := "Testfile"
-	ctx := newContext().(*httpContext)
+	ctx := newContext(&caddy.Instance{Storage: make(map[interface{}]interface{})}).(*httpContext)
 	input := strings.NewReader("localhost {\n}\nLOCALHOST {\n}")
 	sblocks, err := caddyfile.Parse(filename, input, nil)
 	if err != nil {
@@ -193,7 +224,7 @@ func TestDirectivesList(t *testing.T) {
 }
 
 func TestContextSaveConfig(t *testing.T) {
-	ctx := newContext().(*httpContext)
+	ctx := newContext(&caddy.Instance{Storage: make(map[interface{}]interface{})}).(*httpContext)
 	ctx.saveConfig("foo", new(SiteConfig))
 	if _, ok := ctx.keysToSiteConfigs["foo"]; !ok {
 		t.Error("Expected config to be saved, but it wasn't")
@@ -208,4 +239,28 @@ func TestContextSaveConfig(t *testing.T) {
 	if got, want := len(ctx.siteConfigs), 2; got != want {
 		t.Errorf("Expected len(siteConfigs) == %d, but was %d", want, got)
 	}
+}
+
+// Test to make sure we are correctly hiding the Caddyfile
+func TestHideCaddyfile(t *testing.T) {
+	ctx := newContext(&caddy.Instance{Storage: make(map[interface{}]interface{})}).(*httpContext)
+	ctx.saveConfig("test", &SiteConfig{
+		Root:            Root,
+		originCaddyfile: "Testfile",
+	})
+	err := hideCaddyfile(ctx)
+	if err != nil {
+		t.Fatalf("Failed to hide Caddyfile, got: %v", err)
+		return
+	}
+	if len(ctx.siteConfigs[0].HiddenFiles) == 0 {
+		t.Fatal("Failed to add Caddyfile to HiddenFiles.")
+		return
+	}
+	for _, file := range ctx.siteConfigs[0].HiddenFiles {
+		if file == "/Testfile" {
+			return
+		}
+	}
+	t.Fatal("Caddyfile missing from HiddenFiles")
 }

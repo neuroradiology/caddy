@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package basicauth implements HTTP Basic Authentication for Caddy.
 //
 // This is useful for simple protections on a website, like requiring
@@ -7,6 +21,7 @@ package basicauth
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
 	"crypto/subtle"
 	"fmt"
@@ -34,8 +49,8 @@ type BasicAuth struct {
 
 // ServeHTTP implements the httpserver.Handler interface.
 func (a BasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
-	var hasAuth bool
-	var isAuthenticated bool
+	var protected, isAuthenticated bool
+	var realm string
 
 	for _, rule := range a.Rules {
 		for _, res := range rule.Resources {
@@ -43,29 +58,43 @@ func (a BasicAuth) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 				continue
 			}
 
-			// Path matches; parse auth header
-			username, password, ok := r.BasicAuth()
-			hasAuth = true
+			// path matches; this endpoint is protected
+			protected = true
+			realm = rule.Realm
 
-			// Check credentials
+			// parse auth header
+			username, password, ok := r.BasicAuth()
+
+			// check credentials
 			if !ok ||
 				username != rule.Username ||
 				!rule.Password(password) {
 				continue
 			}
 
-			// Flag set only on successful authentication
+			// by this point, authentication was successful
 			isAuthenticated = true
+
+			// let upstream middleware (e.g. fastcgi and cgi) know about authenticated
+			// user; this replaces the request with a wrapped instance
+			r = r.WithContext(context.WithValue(r.Context(),
+				httpserver.RemoteUserCtxKey, username))
+
+			// Provide username to be used in log by replacer
+			repl := httpserver.NewReplacer(r, nil, "-")
+			repl.Set("user", username)
 		}
 	}
 
-	if hasAuth {
-		if !isAuthenticated {
-			w.Header().Set("WWW-Authenticate", "Basic realm=\"Restricted\"")
-			return http.StatusUnauthorized, nil
+	if protected && !isAuthenticated {
+		// browsers show a message that says something like:
+		// "The website says: <realm>"
+		// which is kinda dumb, but whatever.
+		if realm == "" {
+			realm = "Restricted"
 		}
-		// "It's an older code, sir, but it checks out. I was about to clear them."
-		return a.Next.ServeHTTP(w, r)
+		w.Header().Set("WWW-Authenticate", "Basic realm=\""+realm+"\"")
+		return http.StatusUnauthorized, nil
 	}
 
 	// Pass-through when no paths match
@@ -79,6 +108,7 @@ type Rule struct {
 	Username  string
 	Password  func(string) bool
 	Resources []string
+	Realm     string // See RFC 1945 and RFC 2617, default: "Restricted"
 }
 
 // PasswordMatcher determines whether a password matches a rule.

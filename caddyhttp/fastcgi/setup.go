@@ -1,10 +1,27 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package fastcgi
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"path/filepath"
-	"strconv"
+	"strings"
+	"time"
 
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
@@ -20,10 +37,6 @@ func init() {
 // setup configures a new FastCGI middleware instance.
 func setup(c *caddy.Controller) error {
 	cfg := httpserver.GetConfig(c)
-	absRoot, err := filepath.Abs(cfg.Root)
-	if err != nil {
-		return err
-	}
 
 	rules, err := fastcgiParse(c)
 	if err != nil {
@@ -35,7 +48,6 @@ func setup(c *caddy.Controller) error {
 			Next:            next,
 			Rules:           rules,
 			Root:            cfg.Root,
-			AbsRoot:         absRoot,
 			FileSys:         http.Dir(cfg.Root),
 			SoftwareName:    caddy.AppName,
 			SoftwareVersion: caddy.AppVersion,
@@ -50,34 +62,47 @@ func setup(c *caddy.Controller) error {
 func fastcgiParse(c *caddy.Controller) ([]Rule, error) {
 	var rules []Rule
 
-	for c.Next() {
-		var rule Rule
+	cfg := httpserver.GetConfig(c)
+	absRoot, err := filepath.Abs(cfg.Root)
+	if err != nil {
+		return nil, err
+	}
 
+	for c.Next() {
 		args := c.RemainingArgs()
 
-		switch len(args) {
-		case 0:
+		if len(args) < 2 || len(args) > 3 {
 			return rules, c.ArgErr()
-		case 1:
-			rule.Path = "/"
-			rule.Address = args[0]
-		case 2:
-			rule.Path = args[0]
-			rule.Address = args[1]
-		case 3:
-			rule.Path = args[0]
-			rule.Address = args[1]
-			err := fastcgiPreset(args[2], &rule)
-			if err != nil {
-				return rules, c.Err("Invalid fastcgi rule preset '" + args[2] + "'")
+		}
+
+		rule := Rule{
+			Root: absRoot,
+			Path: args[0],
+		}
+
+		upstreams := []string{args[1]}
+
+		srvUpstream := false
+		if strings.HasPrefix(upstreams[0], "srv://") {
+			srvUpstream = true
+		}
+
+		if len(args) == 3 {
+			if err := fastcgiPreset(args[2], &rule); err != nil {
+				return rules, err
 			}
 		}
 
-		network, address := parseAddress(rule.Address)
-		rule.dialer = basicDialer{network: network, address: address}
+		var err error
 
 		for c.NextBlock() {
 			switch c.Val() {
+			case "root":
+				if !c.NextArg() {
+					return rules, c.ArgErr()
+				}
+				rule.Root = c.Val()
+
 			case "ext":
 				if !c.NextArg() {
 					return rules, c.ArgErr()
@@ -94,6 +119,19 @@ func fastcgiParse(c *caddy.Controller) ([]Rule, error) {
 					return rules, c.ArgErr()
 				}
 				rule.IndexFiles = args
+
+			case "upstream":
+				if srvUpstream {
+					return rules, c.Err("additional upstreams are not supported with SRV upstream")
+				}
+
+				args := c.RemainingArgs()
+
+				if len(args) != 1 {
+					return rules, c.ArgErr()
+				}
+
+				upstreams = append(upstreams, args[0])
 			case "env":
 				envArgs := c.RemainingArgs()
 				if len(envArgs) < 2 {
@@ -106,26 +144,60 @@ func fastcgiParse(c *caddy.Controller) ([]Rule, error) {
 					return rules, c.ArgErr()
 				}
 				rule.IgnoredSubPaths = ignoredPaths
-			case "pool":
+
+			case "connect_timeout":
 				if !c.NextArg() {
 					return rules, c.ArgErr()
 				}
-				pool, err := strconv.Atoi(c.Val())
+				rule.ConnectTimeout, err = time.ParseDuration(c.Val())
 				if err != nil {
 					return rules, err
 				}
-				if pool >= 0 {
-					rule.dialer = &persistentDialer{size: pool, network: network, address: address}
-				} else {
-					return rules, c.Errf("positive integer expected, found %d", pool)
+			case "read_timeout":
+				if !c.NextArg() {
+					return rules, c.ArgErr()
 				}
+				readTimeout, err := time.ParseDuration(c.Val())
+				if err != nil {
+					return rules, err
+				}
+				rule.ReadTimeout = readTimeout
+			case "send_timeout":
+				if !c.NextArg() {
+					return rules, c.ArgErr()
+				}
+				sendTimeout, err := time.ParseDuration(c.Val())
+				if err != nil {
+					return rules, err
+				}
+				rule.SendTimeout = sendTimeout
 			}
+		}
+
+		if srvUpstream {
+			balancer, err := parseSRV(upstreams[0])
+			if err != nil {
+				return rules, c.Err("malformed service locator string: " + err.Error())
+			}
+			rule.balancer = balancer
+		} else {
+			rule.balancer = &roundRobin{addresses: upstreams, index: -1}
 		}
 
 		rules = append(rules, rule)
 	}
-
 	return rules, nil
+}
+
+func parseSRV(locator string) (*srv, error) {
+	if locator[6:] == "" {
+		return nil, fmt.Errorf("%s does not include the host", locator)
+	}
+
+	return &srv{
+		service:  locator[6:],
+		resolver: &net.Resolver{},
+	}, nil
 }
 
 // fastcgiPreset configures rule according to name. It returns an error if

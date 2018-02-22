@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package root
 
 import (
@@ -14,7 +28,7 @@ import (
 
 func TestRoot(t *testing.T) {
 	// Predefined error substrings
-	parseErrContent := "Parse error:"
+	parseErrContent := "pars"
 	unableToAccessErrContent := "Unable to access root path"
 
 	existingDirPath, err := getTempDirPath()
@@ -53,6 +67,9 @@ func TestRoot(t *testing.T) {
 			`root `, true, "", parseErrContent,
 		},
 		{
+			`root /a /b`, true, "", parseErrContent,
+		},
+		{
 			fmt.Sprintf(`root %s`, inaccessiblePath), true, "", unableToAccessErrContent,
 		},
 		{
@@ -68,7 +85,7 @@ func TestRoot(t *testing.T) {
 		cfg := httpserver.GetConfig(c)
 
 		if test.shouldErr && err == nil {
-			t.Errorf("Test %d: Expected error but found %s for input %s", i, err, test.input)
+			t.Errorf("Test %d: Expected error but got nil for input '%s'", i, test.input)
 		}
 
 		if err != nil {
@@ -77,7 +94,7 @@ func TestRoot(t *testing.T) {
 			}
 
 			if !strings.Contains(err.Error(), test.expectedErrContent) {
-				t.Errorf("Test %d: Expected error to contain: %v, found error: %v, input: %s", i, test.expectedErrContent, err, test.input)
+				t.Errorf("Test %d: Expected error to contain '%v', found error: %v, input: %s", i, test.expectedErrContent, err, test.input)
 			}
 		}
 
@@ -88,7 +105,7 @@ func TestRoot(t *testing.T) {
 	}
 }
 
-// getTempDirPath returnes the path to the system temp directory. If it does not exists - an error is returned.
+// getTempDirPath returns the path to the system temp directory. If it does not exists - an error is returned.
 func getTempDirPath() (string, error) {
 	tempDir := os.TempDir()
 	_, err := os.Stat(tempDir)
@@ -100,4 +117,40 @@ func getTempDirPath() (string, error) {
 
 func getInaccessiblePath(file string) string {
 	return filepath.Join("C:", "file\x00name") // null byte in filename is not allowed on Windows AND unix
+}
+
+func TestSymlinkRoot(t *testing.T) {
+	origDir, err := ioutil.TempDir("", "root_test")
+	if err != nil {
+		t.Fatalf("BeforeTest: Failed to create temp dir for testing! Error was: %v", err)
+	}
+	defer func() {
+		os.Remove(origDir)
+	}()
+
+	tempDir, err := getTempDirPath()
+	if err != nil {
+		t.Fatalf("BeforeTest: Failed to find an existing directory for testing! Error was: %v", err)
+	}
+	symlinkDir := filepath.Join(tempDir, "symlink")
+
+	err = os.Symlink(origDir, symlinkDir)
+	if err != nil {
+		if strings.Contains(err.Error(), "A required privilege is not held by the client") {
+			t.Skip("BeforeTest:  A required privilege is not held by the client and is required to create a symlink to run this test.")
+		}
+		t.Fatalf("BeforeTest: Cannot create symlink! Error was: %v", err)
+	}
+	defer func() {
+		os.Remove(symlinkDir)
+	}()
+
+	input := fmt.Sprintf(`root %s`, symlinkDir)
+	c := caddy.NewTestController("http", input)
+	err = setupRoot(c)
+	_ = httpserver.GetConfig(c)
+
+	if err != nil {
+		t.Errorf("Test Symlink Root: Expected no error but found one for input %s. Error was: %v", input, err)
+	}
 }

@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package gzip
 
 import (
@@ -33,7 +47,7 @@ func TestLengthFilter(t *testing.T) {
 		for j, filter := range filters {
 			r := httptest.NewRecorder()
 			r.Header().Set("Content-Length", fmt.Sprint(ts.length))
-			wWriter := NewResponseFilterWriter([]ResponseFilter{filter}, &gzipResponseWriter{gzip.NewWriter(r), r, false})
+			wWriter := NewResponseFilterWriter([]ResponseFilter{filter}, &gzipResponseWriter{gzip.NewWriter(r), &httpserver.ResponseWriterWrapper{ResponseWriter: r}, false})
 			if filter.ShouldCompress(wWriter) != ts.shouldCompress[j] {
 				t.Errorf("Test %v: Expected %v found %v", i, ts.shouldCompress[j], filter.ShouldCompress(r))
 			}
@@ -85,5 +99,28 @@ func TestResponseFilterWriter(t *testing.T) {
 				t.Errorf("Test %v: Compression expected, found %v", i, resp)
 			}
 		}
+	}
+}
+
+func TestResponseGzippedOutput(t *testing.T) {
+	server := Gzip{Configs: []Config{
+		{ResponseFilters: []ResponseFilter{SkipCompressedFilter{}}},
+	}}
+
+	server.Next = httpserver.HandlerFunc(func(w http.ResponseWriter, r *http.Request) (int, error) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Write([]byte("gzipped"))
+		return 200, nil
+	})
+
+	r := urlRequest("/")
+	r.Header.Set("Accept-Encoding", "gzip")
+
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, r)
+	resp := w.Body.String()
+
+	if resp != "gzipped" {
+		t.Errorf("Expected output not to be gzipped")
 	}
 }

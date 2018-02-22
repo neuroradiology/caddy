@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Forked Jan. 2015 from http://bitbucket.org/PinIdea/fcgi_client
 // (which is forked from https://code.google.com/p/go-fastcgi-client/)
 
@@ -13,6 +27,7 @@ package fastcgi
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -28,6 +43,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // FCGIListenSockFileno describes listen socket file number.
@@ -44,7 +60,6 @@ const FCGINullRequestID uint8 = 0
 
 // FCGIKeepConn describes keep connection mode.
 const FCGIKeepConn uint8 = 1
-const doubleCRLF = "\r\n\r\n"
 
 const (
 	// BeginRequest is the begin request flag.
@@ -138,7 +153,7 @@ func (rec *record) read(r io.Reader) (buf []byte, err error) {
 		return
 	}
 	if rec.h.Version != 1 {
-		err = errInvalidHeaderVersion
+		err = errors.New("fcgi: invalid header version")
 		return
 	}
 	if rec.h.Type == EndRequest {
@@ -160,20 +175,23 @@ func (rec *record) read(r io.Reader) (buf []byte, err error) {
 // FCGIClient implements a FastCGI client, which is a standard for
 // interfacing external applications with Web servers.
 type FCGIClient struct {
-	mutex     sync.Mutex
-	rwc       io.ReadWriteCloser
-	h         header
-	buf       bytes.Buffer
-	stderr    bytes.Buffer
-	keepAlive bool
-	reqID     uint16
+	mutex       sync.Mutex
+	rwc         io.ReadWriteCloser
+	h           header
+	buf         bytes.Buffer
+	stderr      bytes.Buffer
+	keepAlive   bool
+	reqID       uint16
+	readTimeout time.Duration
+	sendTimeout time.Duration
 }
 
-// DialWithDialer connects to the fcgi responder at the specified network address, using custom net.Dialer.
+// DialWithDialerContext connects to the fcgi responder at the specified network address, using custom net.Dialer
+// and a context.
 // See func net.Dial for a description of the network and address parameters.
-func DialWithDialer(network, address string, dialer net.Dialer) (fcgi *FCGIClient, err error) {
+func DialWithDialerContext(ctx context.Context, network, address string, dialer net.Dialer) (fcgi *FCGIClient, err error) {
 	var conn net.Conn
-	conn, err = dialer.Dial(network, address)
+	conn, err = dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return
 	}
@@ -187,15 +205,20 @@ func DialWithDialer(network, address string, dialer net.Dialer) (fcgi *FCGIClien
 	return
 }
 
+// DialContext is like Dial but passes ctx to dialer.Dial.
+func DialContext(ctx context.Context, network, address string) (fcgi *FCGIClient, err error) {
+	return DialWithDialerContext(ctx, network, address, net.Dialer{})
+}
+
 // Dial connects to the fcgi responder at the specified network address, using default net.Dialer.
 // See func net.Dial for a description of the network and address parameters.
 func Dial(network, address string) (fcgi *FCGIClient, err error) {
-	return DialWithDialer(network, address, net.Dialer{})
+	return DialContext(context.Background(), network, address)
 }
 
-// Close closes fcgi connnection.
-func (c *FCGIClient) Close() error {
-	return c.rwc.Close()
+// Close closes fcgi connnection
+func (c *FCGIClient) Close() {
+	c.rwc.Close()
 }
 
 func (c *FCGIClient) writeRecord(recType uint8, content []byte) (err error) {
@@ -259,29 +282,6 @@ func (c *FCGIClient) writePairs(recType uint8, pairs map[string]string) error {
 	}
 	w.Close()
 	return nil
-}
-
-func readSize(s []byte) (uint32, int) {
-	if len(s) == 0 {
-		return 0, 0
-	}
-	size, n := uint32(s[0]), 1
-	if size&(1<<7) != 0 {
-		if len(s) < 4 {
-			return 0, 0
-		}
-		n = 4
-		size = binary.BigEndian.Uint32(s)
-		size &^= 1 << 31
-	}
-	return size, n
-}
-
-func readString(s []byte, size uint32) string {
-	if size > uint32(len(s)) {
-		return ""
-	}
-	return string(s[:size])
 }
 
 func encodeSize(b []byte, size uint32) int {
@@ -358,9 +358,7 @@ func (w *streamReader) Read(p []byte) (n int, err error) {
 				rec := &record{}
 				var buf []byte
 				buf, err = rec.read(w.c.rwc)
-				if err == errInvalidHeaderVersion {
-					continue
-				} else if err != nil {
+				if err != nil {
 					return
 				}
 				// standard error output
@@ -387,7 +385,7 @@ func (w *streamReader) Read(p []byte) (n int, err error) {
 // Do made the request and returns a io.Reader that translates the data read
 // from fcgi responder out of fcgi packet before returning it.
 func (c *FCGIClient) Do(p map[string]string, req io.Reader) (r io.Reader, err error) {
-	err = c.writeBeginRequest(uint16(Responder), FCGIKeepConn)
+	err = c.writeBeginRequest(uint16(Responder), 0)
 	if err != nil {
 		return
 	}
@@ -410,16 +408,15 @@ func (c *FCGIClient) Do(p map[string]string, req io.Reader) (r io.Reader, err er
 // clientCloser is a io.ReadCloser. It wraps a io.Reader with a Closer
 // that closes FCGIClient connection.
 type clientCloser struct {
-	f *FCGIClient
+	*FCGIClient
 	io.Reader
 }
 
-func (c clientCloser) Close() error { return c.f.Close() }
+func (f clientCloser) Close() error { return f.rwc.Close() }
 
 // Request returns a HTTP Response with Header and Body
 // from fcgi responder
 func (c *FCGIClient) Request(p map[string]string, req io.Reader) (resp *http.Response, err error) {
-
 	r, err := c.Do(p, req)
 	if err != nil {
 		return
@@ -463,12 +460,12 @@ func (c *FCGIClient) Request(p map[string]string, req io.Reader) (resp *http.Res
 }
 
 // Get issues a GET request to the fcgi responder.
-func (c *FCGIClient) Get(p map[string]string) (resp *http.Response, err error) {
+func (c *FCGIClient) Get(p map[string]string, body io.Reader, l int64) (resp *http.Response, err error) {
 
 	p["REQUEST_METHOD"] = "GET"
-	p["CONTENT_LENGTH"] = "0"
+	p["CONTENT_LENGTH"] = strconv.FormatInt(l, 10)
 
-	return c.Request(p, nil)
+	return c.Request(p, body)
 }
 
 // Head issues a HEAD request to the fcgi responder.
@@ -491,7 +488,7 @@ func (c *FCGIClient) Options(p map[string]string) (resp *http.Response, err erro
 
 // Post issues a POST request to the fcgi responder. with request body
 // in the format that bodyType specified
-func (c *FCGIClient) Post(p map[string]string, method string, bodyType string, body io.Reader, l int) (resp *http.Response, err error) {
+func (c *FCGIClient) Post(p map[string]string, method string, bodyType string, body io.Reader, l int64) (resp *http.Response, err error) {
 	if p == nil {
 		p = make(map[string]string)
 	}
@@ -502,7 +499,7 @@ func (c *FCGIClient) Post(p map[string]string, method string, bodyType string, b
 		p["REQUEST_METHOD"] = "POST"
 	}
 
-	p["CONTENT_LENGTH"] = strconv.Itoa(l)
+	p["CONTENT_LENGTH"] = strconv.FormatInt(l, 10)
 	if len(bodyType) > 0 {
 		p["CONTENT_TYPE"] = bodyType
 	} else {
@@ -516,7 +513,7 @@ func (c *FCGIClient) Post(p map[string]string, method string, bodyType string, b
 // as a string key to a list values (url.Values)
 func (c *FCGIClient) PostForm(p map[string]string, data url.Values) (resp *http.Response, err error) {
 	body := bytes.NewReader([]byte(data.Encode()))
-	return c.Post(p, "POST", "application/x-www-form-urlencoded", body, body.Len())
+	return c.Post(p, "POST", "application/x-www-form-urlencoded", body, int64(body.Len()))
 }
 
 // PostFile issues a POST to the fcgi responder in multipart(RFC 2046) standard,
@@ -558,10 +555,26 @@ func (c *FCGIClient) PostFile(p map[string]string, data url.Values, file map[str
 		return
 	}
 
-	return c.Post(p, "POST", bodyType, buf, buf.Len())
+	return c.Post(p, "POST", bodyType, buf, int64(buf.Len()))
+}
+
+// SetReadTimeout sets the read timeout for future calls that read from the
+// fcgi responder. A zero value for t means no timeout will be set.
+func (c *FCGIClient) SetReadTimeout(t time.Duration) error {
+	if conn, ok := c.rwc.(net.Conn); ok && t != 0 {
+		return conn.SetReadDeadline(time.Now().Add(t))
+	}
+	return nil
+}
+
+// SetSendTimeout sets the read timeout for future calls that send data to
+// the fcgi responder. A zero value for t means no timeout will be set.
+func (c *FCGIClient) SetSendTimeout(t time.Duration) error {
+	if conn, ok := c.rwc.(net.Conn); ok && t != 0 {
+		return conn.SetWriteDeadline(time.Now().Add(t))
+	}
+	return nil
 }
 
 // Checks whether chunked is part of the encodings stack
 func chunked(te []string) bool { return len(te) > 0 && te[0] == "chunked" }
-
-var errInvalidHeaderVersion = errors.New("fcgi: invalid header version")

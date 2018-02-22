@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package metadata
 
 import (
@@ -27,17 +41,13 @@ type Metadata struct {
 	Date time.Time
 
 	// Variables to be used with Template
-	Variables map[string]string
-
-	// Flags to be used with Template
-	Flags map[string]bool
+	Variables map[string]interface{}
 }
 
 // NewMetadata returns a new Metadata struct, loaded with the given map
 func NewMetadata(parsedMap map[string]interface{}) Metadata {
 	md := Metadata{
-		Variables: make(map[string]string),
-		Flags:     make(map[string]bool),
+		Variables: make(map[string]interface{}),
 	}
 	md.load(parsedMap)
 
@@ -63,15 +73,7 @@ func (m *Metadata) load(parsedMap map[string]interface{}) {
 		}
 	}
 
-	// Store everything as a flag or variable
-	for key, val := range parsedMap {
-		switch v := val.(type) {
-		case bool:
-			m.Flags[key] = v
-		case string:
-			m.Variables[key] = v
-		}
-	}
+	m.Variables = parsedMap
 }
 
 // Parser is a an interface that must be satisfied by each parser

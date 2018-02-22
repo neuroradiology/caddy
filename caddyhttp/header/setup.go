@@ -1,6 +1,22 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package header
 
 import (
+	"net/http"
+
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
 )
@@ -31,6 +47,7 @@ func headersParse(c *caddy.Controller) ([]Rule, error) {
 
 	for c.NextLine() {
 		var head Rule
+		head.Headers = http.Header{}
 		var isNewPattern bool
 
 		if !c.NextArg() {
@@ -54,27 +71,30 @@ func headersParse(c *caddy.Controller) ([]Rule, error) {
 
 		for c.NextBlock() {
 			// A block of headers was opened...
+			name := c.Val()
+			value := ""
 
-			h := Header{Name: c.Val()}
+			args := c.RemainingArgs()
 
-			if c.NextArg() {
-				h.Value = c.Val()
+			if len(args) > 1 {
+				return rules, c.ArgErr()
+			} else if len(args) == 1 {
+				value = args[0]
 			}
 
-			head.Headers = append(head.Headers, h)
+			head.Headers.Add(name, value)
 		}
 		if c.NextArg() {
 			// ... or single header was defined as an argument instead.
 
-			h := Header{Name: c.Val()}
-
-			h.Value = c.Val()
+			name := c.Val()
+			value := c.Val()
 
 			if c.NextArg() {
-				h.Value = c.Val()
+				value = c.Val()
 			}
 
-			head.Headers = append(head.Headers, h)
+			head.Headers.Add(name, value)
 		}
 
 		if isNewPattern {

@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package httpserver
 
 import (
@@ -7,21 +21,25 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyfile"
+	"github.com/mholt/caddy/caddyhttp/staticfiles"
 	"github.com/mholt/caddy/caddytls"
 )
 
 const serverType = "http"
 
 func init() {
+	flag.StringVar(&HTTPPort, "http-port", HTTPPort, "Default port to use for HTTP")
+	flag.StringVar(&HTTPSPort, "https-port", HTTPSPort, "Default port to use for HTTPS")
 	flag.StringVar(&Host, "host", DefaultHost, "Default host")
 	flag.StringVar(&Port, "port", DefaultPort, "Default port")
 	flag.StringVar(&Root, "root", DefaultRoot, "Root path of default site")
-	flag.DurationVar(&GracefulTimeout, "grace", 5*time.Second, "Maximum duration of graceful shutdown") // TODO
+	flag.DurationVar(&GracefulTimeout, "grace", 5*time.Second, "Maximum duration of graceful shutdown")
 	flag.BoolVar(&HTTP2, "http2", true, "Use HTTP/2")
 	flag.BoolVar(&QUIC, "quic", false, "Use experimental QUIC")
 
@@ -44,15 +62,42 @@ func init() {
 		NewContext: newContext,
 	})
 	caddy.RegisterCaddyfileLoader("short", caddy.LoaderFunc(shortCaddyfileLoader))
+	caddy.RegisterParsingCallback(serverType, "root", hideCaddyfile)
 	caddy.RegisterParsingCallback(serverType, "tls", activateHTTPS)
 	caddytls.RegisterConfigGetter(serverType, func(c *caddy.Controller) *caddytls.Config { return GetConfig(c).TLS })
 }
 
-func newContext() caddy.Context {
-	return &httpContext{keysToSiteConfigs: make(map[string]*SiteConfig)}
+// hideCaddyfile hides the source/origin Caddyfile if it is within the
+// site root. This function should be run after parsing the root directive.
+func hideCaddyfile(cctx caddy.Context) error {
+	ctx := cctx.(*httpContext)
+	for _, cfg := range ctx.siteConfigs {
+		// if no Caddyfile exists exit.
+		if cfg.originCaddyfile == "" {
+			return nil
+		}
+		absRoot, err := filepath.Abs(cfg.Root)
+		if err != nil {
+			return err
+		}
+		absOriginCaddyfile, err := filepath.Abs(cfg.originCaddyfile)
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(absOriginCaddyfile, absRoot) {
+			cfg.HiddenFiles = append(cfg.HiddenFiles, filepath.ToSlash(strings.TrimPrefix(absOriginCaddyfile, absRoot)))
+		}
+	}
+	return nil
+}
+
+func newContext(inst *caddy.Instance) caddy.Context {
+	return &httpContext{instance: inst, keysToSiteConfigs: make(map[string]*SiteConfig)}
 }
 
 type httpContext struct {
+	instance *caddy.Instance
+
 	// keysToSiteConfigs maps an address at the top of a
 	// server block (a "key") to its SiteConfig. Not all
 	// SiteConfigs will be represented here, only ones
@@ -72,12 +117,14 @@ func (h *httpContext) saveConfig(key string, cfg *SiteConfig) {
 // executing directives and otherwise prepares the directives to
 // be parsed and executed.
 func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []caddyfile.ServerBlock) ([]caddyfile.ServerBlock, error) {
+	siteAddrs := make(map[string]string)
+
 	// For each address in each server block, make a new config
 	for _, sb := range serverBlocks {
 		for _, key := range sb.Keys {
 			key = strings.ToLower(key)
 			if _, dup := h.keysToSiteConfigs[key]; dup {
-				return serverBlocks, fmt.Errorf("duplicate site address: %s", key)
+				return serverBlocks, fmt.Errorf("duplicate site key: %s", key)
 			}
 			addr, err := standardizeAddress(key)
 			if err != nil {
@@ -93,12 +140,48 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 				addr.Port = Port
 			}
 
+			// Make sure the adjusted site address is distinct
+			addrCopy := addr // make copy so we don't disturb the original, carefully-parsed address struct
+			if addrCopy.Port == "" && Port == DefaultPort {
+				addrCopy.Port = Port
+			}
+			addrStr := strings.ToLower(addrCopy.String())
+			if otherSiteKey, dup := siteAddrs[addrStr]; dup {
+				err := fmt.Errorf("duplicate site address: %s", addrStr)
+				if (addrCopy.Host == Host && Host != DefaultHost) ||
+					(addrCopy.Port == Port && Port != DefaultPort) {
+					err = fmt.Errorf("site defined as %s is a duplicate of %s because of modified "+
+						"default host and/or port values (usually via -host or -port flags)", key, otherSiteKey)
+				}
+				return serverBlocks, err
+			}
+			siteAddrs[addrStr] = key
+
+			// If default HTTP or HTTPS ports have been customized,
+			// make sure the ACME challenge ports match
+			var altHTTPPort, altTLSSNIPort string
+			if HTTPPort != DefaultHTTPPort {
+				altHTTPPort = HTTPPort
+			}
+			if HTTPSPort != DefaultHTTPSPort {
+				altTLSSNIPort = HTTPSPort
+			}
+
+			// Make our caddytls.Config, which has a pointer to the
+			// instance's certificate cache and enough information
+			// to use automatic HTTPS when the time comes
+			caddytlsConfig := caddytls.NewConfig(h.instance)
+			caddytlsConfig.Hostname = addr.Host
+			caddytlsConfig.AltHTTPPort = altHTTPPort
+			caddytlsConfig.AltTLSSNIPort = altTLSSNIPort
+
 			// Save the config to our master list, and key it for lookups
 			cfg := &SiteConfig{
-				Addr:        addr,
-				Root:        Root,
-				TLS:         &caddytls.Config{Hostname: addr.Host},
-				HiddenFiles: []string{sourceFile},
+				Addr:            addr,
+				Root:            Root,
+				TLS:             caddytlsConfig,
+				originCaddyfile: sourceFile,
+				IndexPages:      staticfiles.DefaultIndexPages,
 			}
 			h.saveConfig(key, cfg)
 		}
@@ -128,7 +211,7 @@ func (h *httpContext) MakeServers() ([]caddy.Server, error) {
 		if !cfg.TLS.Enabled {
 			continue
 		}
-		if cfg.Addr.Port == "80" || cfg.Addr.Scheme == "http" {
+		if cfg.Addr.Port == HTTPPort || cfg.Addr.Scheme == "http" {
 			cfg.TLS.Enabled = false
 			log.Printf("[WARNING] TLS disabled for %s", cfg.Addr)
 		} else if cfg.Addr.Scheme == "" {
@@ -143,7 +226,7 @@ func (h *httpContext) MakeServers() ([]caddy.Server, error) {
 			// this is vital, otherwise the function call below that
 			// sets the listener address will use the default port
 			// instead of 443 because it doesn't know about TLS.
-			cfg.Addr.Port = "443"
+			cfg.Addr.Port = HTTPSPort
 		}
 	}
 
@@ -178,7 +261,7 @@ func GetConfig(c *caddy.Controller) *SiteConfig {
 	// we should only get here during tests because directive
 	// actions typically skip the server blocks where we make
 	// the configs
-	cfg := &SiteConfig{Root: Root, TLS: new(caddytls.Config)}
+	cfg := &SiteConfig{Root: Root, TLS: new(caddytls.Config), IndexPages: staticfiles.DefaultIndexPages}
 	ctx.saveConfig(key, cfg)
 	return cfg
 }
@@ -212,7 +295,7 @@ func groupSiteConfigsByListenAddr(configs []*SiteConfig) (map[string][]*SiteConf
 		// We would add a special case here so that localhost addresses
 		// bind to 127.0.0.1 if conf.ListenHost is not already set, which
 		// would prevent outsiders from even connecting; but that was problematic:
-		// https://forum.caddyserver.com/t/wildcard-virtual-domains-with-wildcard-roots/221/5?u=matt
+		// https://caddy.community/t/wildcard-virtual-domains-with-wildcard-roots/221/5?u=matt
 
 		if conf.Addr.Port == "" {
 			conf.Addr.Port = Port
@@ -244,7 +327,7 @@ func (a Address) String() string {
 	}
 	scheme := a.Scheme
 	if scheme == "" {
-		if a.Port == "443" {
+		if a.Port == HTTPSPort {
 			scheme = "https"
 		} else {
 			scheme = "http"
@@ -256,8 +339,8 @@ func (a Address) String() string {
 	}
 	s += a.Host
 	if a.Port != "" &&
-		((scheme == "https" && a.Port != "443") ||
-			(scheme == "http" && a.Port != "80")) {
+		((scheme == "https" && a.Port != DefaultHTTPSPort) ||
+			(scheme == "http" && a.Port != DefaultHTTPPort)) {
 		s += ":" + a.Port
 	}
 	if a.Path != "" {
@@ -301,9 +384,9 @@ func standardizeAddress(str string) (Address, error) {
 	// see if we can set port based off scheme
 	if port == "" {
 		if u.Scheme == "http" {
-			port = "80"
+			port = HTTPPort
 		} else if u.Scheme == "https" {
-			port = "443"
+			port = HTTPSPort
 		}
 	}
 
@@ -313,17 +396,17 @@ func standardizeAddress(str string) (Address, error) {
 	}
 
 	// error if scheme and port combination violate convention
-	if (u.Scheme == "http" && port == "443") || (u.Scheme == "https" && port == "80") {
+	if (u.Scheme == "http" && port == HTTPSPort) || (u.Scheme == "https" && port == HTTPPort) {
 		return Address{}, fmt.Errorf("[%s] scheme and port violate convention", input)
 	}
 
 	// standardize http and https ports to their respective port numbers
 	if port == "http" {
 		u.Scheme = "http"
-		port = "80"
+		port = HTTPPort
 	} else if port == "https" {
 		u.Scheme = "https"
-		port = "443"
+		port = HTTPSPort
 	}
 
 	return Address{Original: input, Scheme: u.Scheme, Host: host, Port: port, Path: u.Path}, err
@@ -392,33 +475,48 @@ func RegisterDevDirective(name, before string) {
 var directives = []string{
 	// primitive actions that set up the fundamental vitals of each config
 	"root",
+	"index",
 	"bind",
+	"limits",
+	"timeouts",
 	"tls",
 
 	// services/utilities, or other directives that don't necessarily inject handlers
-	"startup",
-	"shutdown",
+	"startup",  // TODO: Deprecate this directive
+	"shutdown", // TODO: Deprecate this directive
+	"on",
+	"request_id",
 	"realip", // github.com/captncraig/caddy-realip
 	"git",    // github.com/abiosoft/caddy-git
+
+	// directives that add listener middleware to the stack
+	"proxyprotocol", // github.com/mastercactapus/caddy-proxyprotocol
 
 	// directives that add middleware to the stack
 	"locale", // github.com/simia-tech/caddy-locale
 	"log",
+	"cache", // github.com/nicolasazrak/caddy-cache
 	"rewrite",
 	"ext",
 	"gzip",
-	"errors",
-	"minify",    // github.com/hacdias/caddy-minify
-	"ipfilter",  // github.com/pyed/ipfilter
-	"ratelimit", // github.com/xuqingfeng/caddy-rate-limit
-	"search",    // github.com/pedronasser/caddy-search
 	"header",
-	"expires", // github.com/epicagency/caddy-expires
+	"errors",
+	"authz",        // github.com/casbin/caddy-authz
+	"filter",       // github.com/echocat/caddy-filter
+	"minify",       // github.com/hacdias/caddy-minify
+	"ipfilter",     // github.com/pyed/ipfilter
+	"ratelimit",    // github.com/xuqingfeng/caddy-rate-limit
+	"search",       // github.com/pedronasser/caddy-search
+	"expires",      // github.com/epicagency/caddy-expires
+	"forwardproxy", // github.com/caddyserver/forwardproxy
 	"basicauth",
 	"redir",
 	"status",
-	"cors", // github.com/captncraig/cors/caddy
+	"cors",   // github.com/captncraig/cors/caddy
+	"nobots", // github.com/Xumeiquer/nobots
 	"mime",
+	"login",     // github.com/tarent/loginsrv/caddy
+	"reauth",    // github.com/freman/caddy-reauth
 	"jwt",       // github.com/BTBurke/caddy-jwt
 	"jsonp",     // github.com/pschlump/caddy-jsonp
 	"upload",    // blitznote.com/src/caddy.upload
@@ -426,18 +524,26 @@ var directives = []string{
 	"internal",
 	"pprof",
 	"expvar",
+	"push",
+	"datadog",    // github.com/payintech/caddy-datadog
 	"prometheus", // github.com/miekg/caddy-prometheus
+	"templates",
 	"proxy",
 	"fastcgi",
+	"cgi", // github.com/jung-kurt/caddy-cgi
 	"websocket",
+	"filemanager", // github.com/hacdias/filemanager/caddy/filemanager
+	"webdav",      // github.com/hacdias/caddy-webdav
 	"markdown",
-	"templates",
 	"browse",
-	"filemanager", // github.com/hacdias/caddy-filemanager
-	"hugo",        // github.com/hacdias/caddy-hugo
-	"mailout",     // github.com/SchumacherFM/mailout
-	"awslambda",   // github.com/coopernurse/caddy-awslambda
-	"filter",      // github.com/echocat/caddy-filter
+	"jekyll",    // github.com/hacdias/filemanager/caddy/jekyll
+	"hugo",      // github.com/hacdias/filemanager/caddy/hugo
+	"mailout",   // github.com/SchumacherFM/mailout
+	"awses",     // github.com/miquella/caddy-awses
+	"awslambda", // github.com/coopernurse/caddy-awslambda
+	"grpc",      // github.com/pieterlouw/caddy-grpc
+	"gopkg",     // github.com/zikes/gopkg
+	"restic",    // github.com/restic/caddy
 }
 
 const (
@@ -447,6 +553,10 @@ const (
 	DefaultPort = "2015"
 	// DefaultRoot is the default root folder.
 	DefaultRoot = "."
+	// DefaultHTTPPort is the default port for HTTP.
+	DefaultHTTPPort = "80"
+	// DefaultHTTPSPort is the default port for HTTPS.
+	DefaultHTTPSPort = "443"
 )
 
 // These "soft defaults" are configurable by
@@ -469,4 +579,10 @@ var (
 
 	// QUIC indicates whether QUIC is enabled or not.
 	QUIC bool
+
+	// HTTPPort is the port to use for HTTP.
+	HTTPPort = DefaultHTTPPort
+
+	// HTTPSPort is the port to use for HTTPS.
+	HTTPSPort = DefaultHTTPSPort
 )

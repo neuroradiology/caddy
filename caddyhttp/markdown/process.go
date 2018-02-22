@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package markdown
 
 import (
@@ -15,6 +29,13 @@ import (
 type FileInfo struct {
 	os.FileInfo
 	ctx httpserver.Context
+}
+
+var recognizedMetaTags = []string{
+	"author",
+	"copyright",
+	"description",
+	"subject",
 }
 
 // Summarize returns an abbreviated string representation of the markdown stored in this file.
@@ -63,6 +84,14 @@ func (c *Config) Markdown(title string, r io.Reader, dirents []os.FileInfo, ctx 
 		mdata.Variables["title"] = title
 	}
 
+	// move available and valid front matters to the meta values
+	meta := make(map[string]string)
+	for _, val := range recognizedMetaTags {
+		if mVal, ok := mdata.Variables[val]; ok {
+			meta[val] = mVal.(string)
+		}
+	}
+
 	// massage possible files
 	files := []FileInfo{}
 	for _, ent := range dirents {
@@ -73,5 +102,5 @@ func (c *Config) Markdown(title string, r io.Reader, dirents []os.FileInfo, ctx 
 		files = append(files, file)
 	}
 
-	return execTemplate(c, mdata, files, ctx)
+	return execTemplate(c, mdata, meta, files, ctx)
 }

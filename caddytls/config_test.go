@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package caddytls
 
 import (
@@ -6,56 +20,42 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+
+	"github.com/codahale/aesnicheck"
 )
 
-func TestMakeTLSConfigProtocolVersions(t *testing.T) {
+func TestConvertTLSConfigProtocolVersions(t *testing.T) {
 	// same min and max protocol versions
-	configs := []*Config{
-		{
-			Enabled:            true,
-			ProtocolMinVersion: tls.VersionTLS12,
-			ProtocolMaxVersion: tls.VersionTLS12,
-		},
+	config := &Config{
+		Enabled:            true,
+		ProtocolMinVersion: tls.VersionTLS12,
+		ProtocolMaxVersion: tls.VersionTLS12,
 	}
-	result, err := MakeTLSConfig(configs)
+	err := config.buildStandardTLSConfig()
 	if err != nil {
 		t.Fatalf("Did not expect an error, but got %v", err)
 	}
-	if got, want := result.MinVersion, uint16(tls.VersionTLS12); got != want {
+	if got, want := config.tlsConfig.MinVersion, uint16(tls.VersionTLS12); got != want {
 		t.Errorf("Expected min version to be %x, got %x", want, got)
 	}
-	if got, want := result.MaxVersion, uint16(tls.VersionTLS12); got != want {
+	if got, want := config.tlsConfig.MaxVersion, uint16(tls.VersionTLS12); got != want {
 		t.Errorf("Expected max version to be %x, got %x", want, got)
 	}
 }
 
-func TestMakeTLSConfigPreferServerCipherSuites(t *testing.T) {
+func TestConvertTLSConfigPreferServerCipherSuites(t *testing.T) {
 	// prefer server cipher suites
-	configs := []*Config{{Enabled: true, PreferServerCipherSuites: true}}
-	result, err := MakeTLSConfig(configs)
+	config := Config{Enabled: true, PreferServerCipherSuites: true}
+	err := config.buildStandardTLSConfig()
 	if err != nil {
 		t.Fatalf("Did not expect an error, but got %v", err)
 	}
-	if got, want := result.PreferServerCipherSuites, true; got != want {
+	if got, want := config.tlsConfig.PreferServerCipherSuites, true; got != want {
 		t.Errorf("Expected PreferServerCipherSuites==%v but got %v", want, got)
-	}
-
-	// make sure we don't get an error if there's a conflict
-	// when both of the configs have TLS disabled
-	configs = []*Config{
-		{Enabled: false, PreferServerCipherSuites: false},
-		{Enabled: false, PreferServerCipherSuites: true},
-	}
-	result, err = MakeTLSConfig(configs)
-	if err != nil {
-		t.Fatalf("Did not expect an error when TLS is disabled, but got '%v'", err)
-	}
-	if result != nil {
-		t.Errorf("Expected nil result because TLS disabled, got: %+v", err)
 	}
 }
 
-func TestMakeTLSConfigTLSEnabledDisabled(t *testing.T) {
+func TestMakeTLSConfigTLSEnabledDisabledError(t *testing.T) {
 	// verify handling when Enabled is true and false
 	configs := []*Config{
 		{Enabled: true},
@@ -65,43 +65,49 @@ func TestMakeTLSConfigTLSEnabledDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected an error, but got %v", err)
 	}
-
-	// verify that when disabled, a nil pair is returned
-	configs = []*Config{{}, {}}
-	result, err := MakeTLSConfig(configs)
-	if err != nil {
-		t.Errorf("Did not expect an error, but got %v", err)
-	}
-	if result != nil {
-		t.Errorf("Expected a nil *tls.Config result, got %+v", result)
-	}
 }
 
-func TestMakeTLSConfigCipherSuites(t *testing.T) {
+func TestConvertTLSConfigCipherSuites(t *testing.T) {
 	// ensure cipher suites are unioned and
 	// that TLS_FALLBACK_SCSV is prepended
 	configs := []*Config{
 		{Enabled: true, Ciphers: []uint16{0xc02c, 0xc030}},
 		{Enabled: true, Ciphers: []uint16{0xc012, 0xc030, 0xc00a}},
-	}
-	result, err := MakeTLSConfig(configs)
-	if err != nil {
-		t.Fatalf("Did not expect an error, but got %v", err)
-	}
-	expected := []uint16{tls.TLS_FALLBACK_SCSV, 0xc02c, 0xc030, 0xc012, 0xc00a}
-	if !reflect.DeepEqual(result.CipherSuites, expected) {
-		t.Errorf("Expected ciphers %v but got %v", expected, result.CipherSuites)
+		{Enabled: true, Ciphers: nil},
 	}
 
-	// use default suites if none specified
-	configs = []*Config{{Enabled: true}}
-	result, err = MakeTLSConfig(configs)
-	if err != nil {
-		t.Fatalf("Did not expect an error, but got %v", err)
+	defaultCiphersExpected := getPreferredDefaultCiphers()
+	expectedCiphers := [][]uint16{
+		{tls.TLS_FALLBACK_SCSV, 0xc02c, 0xc030},
+		{tls.TLS_FALLBACK_SCSV, 0xc012, 0xc030, 0xc00a},
+		append([]uint16{tls.TLS_FALLBACK_SCSV}, defaultCiphersExpected...),
 	}
-	expected = append([]uint16{tls.TLS_FALLBACK_SCSV}, defaultCiphers...)
-	if !reflect.DeepEqual(result.CipherSuites, expected) {
-		t.Errorf("Expected default ciphers %v but got %v", expected, result.CipherSuites)
+
+	for i, config := range configs {
+		err := config.buildStandardTLSConfig()
+		if err != nil {
+			t.Errorf("Test %d: Expected no error, got: %v", i, err)
+		}
+		if !reflect.DeepEqual(config.tlsConfig.CipherSuites, expectedCiphers[i]) {
+			t.Errorf("Test %d: Expected ciphers %v but got %v",
+				i, expectedCiphers[i], config.tlsConfig.CipherSuites)
+		}
+
+	}
+}
+
+func TestGetPreferredDefaultCiphers(t *testing.T) {
+	expectedCiphers := defaultCiphers
+	if !aesnicheck.HasAESNI() {
+		expectedCiphers = defaultCiphersNonAESNI
+	}
+
+	// Ensure ordering is correct and ciphers are what we expected.
+	result := getPreferredDefaultCiphers()
+	for i, actual := range result {
+		if actual != expectedCiphers[i] {
+			t.Errorf("Expected cipher in position %d to be %0x, got %0x", i, expectedCiphers[i], actual)
+		}
 	}
 }
 

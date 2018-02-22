@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package basicauth
 
 import (
@@ -64,12 +78,39 @@ md5:$apr1$l42y8rex$pOA2VJ0x/0TwaFeAF9nX61`
 		}`, false, "pwd", []Rule{
 			{Username: "user"},
 		}},
+		{`basicauth /resource1 user pwd {
+		}`, false, "pwd", []Rule{
+			{Username: "user", Resources: []string{"/resource1"}},
+		}},
+		{`basicauth /resource1 user pwd {
+			realm Resources
+		}`, false, "pwd", []Rule{
+			{Username: "user", Resources: []string{"/resource1"}, Realm: "Resources"},
+		}},
 		{`basicauth user pwd {
 			/resource1
 			/resource2
 		}`, false, "pwd", []Rule{
 			{Username: "user", Resources: []string{"/resource1", "/resource2"}},
 		}},
+		{`basicauth user pwd {
+			/resource1
+			/resource2
+			realm "Secure resources"
+		}`, false, "pwd", []Rule{
+			{Username: "user", Resources: []string{"/resource1", "/resource2"}, Realm: "Secure resources"},
+		}},
+		{`basicauth user pwd {
+			/resource1
+			realm "Secure resources"
+			realm Extra
+			/resource2
+		}`, true, "pwd", []Rule{}},
+		{`basicauth user pwd {
+			/resource1
+			foo "Resources"
+			/resource2
+		}`, true, "pwd", []Rule{}},
 		{`basicauth /resource user pwd`, false, "pwd", []Rule{
 			{Username: "user", Resources: []string{"/resource"}},
 		}},
@@ -107,6 +148,11 @@ md5:$apr1$l42y8rex$pOA2VJ0x/0TwaFeAF9nX61`
 			if actualRule.Username != expectedRule.Username {
 				t.Errorf("Test %d, rule %d: Expected username '%s', got '%s'",
 					i, j, expectedRule.Username, actualRule.Username)
+			}
+
+			if actualRule.Realm != expectedRule.Realm {
+				t.Errorf("Test %d, rule %d: Expected realm '%s', got '%s'",
+					i, j, expectedRule.Realm, actualRule.Realm)
 			}
 
 			if strings.Contains(test.input, "htpasswd=") && skipHtpassword {

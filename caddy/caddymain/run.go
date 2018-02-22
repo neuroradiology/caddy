@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package caddymain
 
 import (
@@ -7,7 +21,6 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -30,6 +43,8 @@ func init() {
 
 	flag.BoolVar(&caddytls.Agreed, "agree", false, "Agree to the CA's Subscriber Agreement")
 	flag.StringVar(&caddytls.DefaultCAUrl, "ca", "https://acme-v01.api.letsencrypt.org/directory", "URL to certificate authority's ACME server directory")
+	flag.BoolVar(&caddytls.DisableHTTPChallenge, "disable-http-challenge", caddytls.DisableHTTPChallenge, "Disable the ACME HTTP challenge")
+	flag.BoolVar(&caddytls.DisableTLSSNIChallenge, "disable-tls-sni-challenge", caddytls.DisableTLSSNIChallenge, "Disable the ACME TLS-SNI challenge")
 	flag.StringVar(&conf, "conf", "", "Caddyfile to load (default \""+caddy.DefaultConfigFile+"\")")
 	flag.StringVar(&cpu, "cpu", "100%", "CPU cap")
 	flag.BoolVar(&plugins, "plugins", false, "List installed plugins")
@@ -41,6 +56,7 @@ func init() {
 	flag.StringVar(&revoke, "revoke", "", "Hostname for which to revoke the certificate")
 	flag.StringVar(&serverType, "type", "http", "Type of server to run")
 	flag.BoolVar(&version, "version", false, "Show version")
+	flag.BoolVar(&validate, "validate", false, "Parse the Caddyfile but do not start the server")
 
 	caddy.RegisterCaddyfileLoader("flag", caddy.LoaderFunc(confLoader))
 	caddy.SetDefaultCaddyfileLoader("default", caddy.LoaderFunc(defaultLoader))
@@ -75,13 +91,13 @@ func Run() {
 	if revoke != "" {
 		err := caddytls.Revoke(revoke)
 		if err != nil {
-			log.Fatal(err)
+			mustLogFatalf("%v", err)
 		}
 		fmt.Printf("Revoked certificate for %s\n", revoke)
 		os.Exit(0)
 	}
 	if version {
-		fmt.Printf("%s %s\n", appName, appVersion)
+		fmt.Printf("%s %s (unofficial)\n", appName, appVersion)
 		if devBuild && gitShortStat != "" {
 			fmt.Printf("%s\n%s\n", gitShortStat, gitFilesModified)
 		}
@@ -92,41 +108,56 @@ func Run() {
 		os.Exit(0)
 	}
 
-	moveStorage() // TODO: This is temporary for the 0.9 release, or until most users upgrade to 0.9+
-
 	// Set CPU cap
 	err := setCPU(cpu)
 	if err != nil {
-		mustLogFatal(err)
+		mustLogFatalf("%v", err)
 	}
 
+	// Executes Startup events
+	caddy.EmitEvent(caddy.StartupEvent, nil)
+
 	// Get Caddyfile input
-	caddyfile, err := caddy.LoadCaddyfile(serverType)
+	caddyfileinput, err := caddy.LoadCaddyfile(serverType)
 	if err != nil {
-		mustLogFatal(err)
+		mustLogFatalf("%v", err)
+	}
+
+	if validate {
+		err := caddy.ValidateAndExecuteDirectives(caddyfileinput, nil, true)
+		if err != nil {
+			mustLogFatalf("%v", err)
+		}
+		msg := "Caddyfile is valid"
+		fmt.Println(msg)
+		log.Printf("[INFO] %s", msg)
+		os.Exit(0)
 	}
 
 	// Start your engines
-	instance, err := caddy.Start(caddyfile)
+	instance, err := caddy.Start(caddyfileinput)
 	if err != nil {
-		mustLogFatal(err)
+		mustLogFatalf("%v", err)
 	}
+
+	// Execute instantiation events
+	caddy.EmitEvent(caddy.InstanceStartupEvent, instance)
 
 	// Twiddle your thumbs
 	instance.Wait()
 }
 
-// mustLogFatal wraps log.Fatal() in a way that ensures the
+// mustLogFatalf wraps log.Fatalf() in a way that ensures the
 // output is always printed to stderr so the user can see it
 // if the user is still there, even if the process log was not
 // enabled. If this process is an upgrade, however, and the user
 // might not be there anymore, this just logs to the process
 // log and exits.
-func mustLogFatal(args ...interface{}) {
+func mustLogFatalf(format string, args ...interface{}) {
 	if !caddy.IsUpgrade() {
 		log.SetOutput(os.Stderr)
 	}
-	log.Fatal(args...)
+	log.Fatalf(format, args...)
 }
 
 // confLoader loads the Caddyfile using the -conf flag.
@@ -139,10 +170,18 @@ func confLoader(serverType string) (caddy.Input, error) {
 		return caddy.CaddyfileFromPipe(os.Stdin, serverType)
 	}
 
-	contents, err := ioutil.ReadFile(conf)
-	if err != nil {
-		return nil, err
+	var contents []byte
+	if strings.Contains(conf, "*") {
+		// Let caddyfile.doImport logic handle the globbed path
+		contents = []byte("import " + conf)
+	} else {
+		var err error
+		contents, err = ioutil.ReadFile(conf)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	return caddy.CaddyfileInput{
 		Contents:       contents,
 		Filepath:       conf,
@@ -166,61 +205,20 @@ func defaultLoader(serverType string) (caddy.Input, error) {
 	}, nil
 }
 
-// moveStorage moves the old certificate storage location by
-// renaming the "letsencrypt" folder to the hostname of the
-// CA URL. This is TEMPORARY until most users have upgraded to 0.9+.
-func moveStorage() {
-	oldPath := filepath.Join(caddy.AssetsPath(), "letsencrypt")
-	_, err := os.Stat(oldPath)
-	if os.IsNotExist(err) {
-		return
-	}
-	// Just use a default config to get default (file) storage
-	fileStorage, err := new(caddytls.Config).StorageFor(caddytls.DefaultCAUrl)
-	if err != nil {
-		log.Fatalf("[ERROR] Unable to get new path for certificate storage: %v", err)
-	}
-	newPath := fileStorage.(*caddytls.FileStorage).Path
-	err = os.MkdirAll(string(newPath), 0700)
-	if err != nil {
-		log.Fatalf("[ERROR] Unable to make new certificate storage path: %v\n\nPlease follow instructions at:\nhttps://github.com/mholt/caddy/issues/902#issuecomment-228876011", err)
-	}
-	err = os.Rename(oldPath, string(newPath))
-	if err != nil {
-		log.Fatalf("[ERROR] Unable to migrate certificate storage: %v\n\nPlease follow instructions at:\nhttps://github.com/mholt/caddy/issues/902#issuecomment-228876011", err)
-	}
-	// convert mixed case folder and file names to lowercase
-	var done bool // walking is recursive and preloads the file names, so we must restart walk after a change until no changes
-	for !done {
-		done = true
-		filepath.Walk(string(newPath), func(path string, info os.FileInfo, err error) error {
-			// must be careful to only lowercase the base of the path, not the whole thing!!
-			base := filepath.Base(path)
-			if lowerBase := strings.ToLower(base); base != lowerBase {
-				lowerPath := filepath.Join(filepath.Dir(path), lowerBase)
-				err = os.Rename(path, lowerPath)
-				if err != nil {
-					log.Fatalf("[ERROR] Unable to lower-case: %v\n\nPlease follow instructions at:\nhttps://github.com/mholt/caddy/issues/902#issuecomment-228876011", err)
-				}
-				// terminate traversal and restart since Walk needs the updated file list with new file names
-				done = false
-				return errors.New("start over")
-			}
-			return nil
-		})
-	}
-}
-
 // setVersion figures out the version information
 // based on variables set by -ldflags.
 func setVersion() {
 	// A development build is one that's not at a tag or has uncommitted changes
 	devBuild = gitTag == "" || gitShortStat != ""
 
+	if buildDate != "" {
+		buildDate = " " + buildDate
+	}
+
 	// Only set the appVersion if -ldflags was used
 	if gitNearestTag != "" || gitTag != "" {
 		if devBuild && gitNearestTag != "" {
-			appVersion = fmt.Sprintf("%s (+%s %s)",
+			appVersion = fmt.Sprintf("%s (+%s%s)",
 				strings.TrimPrefix(gitNearestTag, "v"), gitCommit, buildDate)
 		} else if gitTag != "" {
 			appVersion = strings.TrimPrefix(gitTag, "v")
@@ -231,6 +229,8 @@ func setVersion() {
 // setCPU parses string cpu and sets GOMAXPROCS
 // according to its value. It accepts either
 // a number (e.g. 3) or a percent (e.g. 50%).
+// If the percent resolves to less than a single
+// GOMAXPROCS, it rounds it up to GOMAXPROCS=1.
 func setCPU(cpu string) error {
 	var numCPU int
 
@@ -246,6 +246,9 @@ func setCPU(cpu string) error {
 		}
 		percent = float32(pctInt) / 100
 		numCPU = int(float32(availCPU) * percent)
+		if numCPU < 1 {
+			numCPU = 1
+		}
 	} else {
 		// Number
 		num, err := strconv.Atoi(cpu)
@@ -274,6 +277,7 @@ var (
 	revoke     string
 	version    bool
 	plugins    bool
+	validate   bool
 )
 
 // Build information obtained with the help of -ldflags

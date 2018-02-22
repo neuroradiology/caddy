@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package basicauth
 
 import (
@@ -14,54 +28,90 @@ import (
 )
 
 func TestBasicAuth(t *testing.T) {
-	rw := BasicAuth{
-		Next: httpserver.HandlerFunc(contentHandler),
-		Rules: []Rule{
-			{Username: "test", Password: PlainMatcher("ttest"), Resources: []string{"/testing"}},
+	var i int
+	// This handler is registered for tests in which the only authorized user is
+	// "okuser"
+	upstreamHandler := func(w http.ResponseWriter, r *http.Request) (int, error) {
+		remoteUser, _ := r.Context().Value(httpserver.RemoteUserCtxKey).(string)
+		if remoteUser != "okuser" {
+			t.Errorf("Test %d: expecting remote user 'okuser', got '%s'", i, remoteUser)
+		}
+		return http.StatusOK, nil
+	}
+	rws := []BasicAuth{
+		{
+			Next: httpserver.HandlerFunc(upstreamHandler),
+			Rules: []Rule{
+				{Username: "okuser", Password: PlainMatcher("okpass"),
+					Resources: []string{"/testing"}, Realm: "Resources"},
+			},
+		},
+		{
+			Next: httpserver.HandlerFunc(upstreamHandler),
+			Rules: []Rule{
+				{Username: "okuser", Password: PlainMatcher("okpass"),
+					Resources: []string{"/testing"}},
+			},
 		},
 	}
 
-	tests := []struct {
-		from   string
-		result int
-		cred   string
-	}{
-		{"/testing", http.StatusUnauthorized, "ttest:test"},
-		{"/testing", http.StatusOK, "test:ttest"},
-		{"/testing", http.StatusUnauthorized, ""},
+	type testType struct {
+		from     string
+		result   int
+		user     string
+		password string
 	}
 
-	for i, test := range tests {
+	tests := []testType{
+		{"/testing", http.StatusOK, "okuser", "okpass"},
+		{"/testing", http.StatusUnauthorized, "baduser", "okpass"},
+		{"/testing", http.StatusUnauthorized, "okuser", "badpass"},
+		{"/testing", http.StatusUnauthorized, "OKuser", "okpass"},
+		{"/testing", http.StatusUnauthorized, "OKuser", "badPASS"},
+		{"/testing", http.StatusUnauthorized, "", "okpass"},
+		{"/testing", http.StatusUnauthorized, "okuser", ""},
+		{"/testing", http.StatusUnauthorized, "", ""},
+	}
 
-		req, err := http.NewRequest("GET", test.from, nil)
-		if err != nil {
-			t.Fatalf("Test %d: Could not create HTTP request %v", i, err)
+	var test testType
+	for _, rw := range rws {
+		expectRealm := rw.Rules[0].Realm
+		if expectRealm == "" {
+			expectRealm = "Restricted" // Default if Realm not specified in rule
 		}
-		auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(test.cred))
-		req.Header.Set("Authorization", auth)
+		for i, test = range tests {
+			req, err := http.NewRequest("GET", test.from, nil)
+			if err != nil {
+				t.Fatalf("Test %d: Could not create HTTP request: %v", i, err)
+			}
+			req.SetBasicAuth(test.user, test.password)
 
-		rec := httptest.NewRecorder()
-		result, err := rw.ServeHTTP(rec, req)
-		if err != nil {
-			t.Fatalf("Test %d: Could not ServeHTTP %v", i, err)
-		}
-		if result != test.result {
-			t.Errorf("Test %d: Expected Header '%d' but was '%d'",
-				i, test.result, result)
-		}
-		if result == http.StatusUnauthorized {
-			headers := rec.Header()
-			if val, ok := headers["Www-Authenticate"]; ok {
-				if val[0] != "Basic realm=\"Restricted\"" {
-					t.Errorf("Test %d, Www-Authenticate should be %s provided %s", i, "Basic", val[0])
+			rec := httptest.NewRecorder()
+			result, err := rw.ServeHTTP(rec, req)
+			if err != nil {
+				t.Fatalf("Test %d: Could not ServeHTTP: %v", i, err)
+			}
+			if result != test.result {
+				t.Errorf("Test %d: Expected status code %d but was %d",
+					i, test.result, result)
+			}
+			if test.result == http.StatusUnauthorized {
+				headers := rec.Header()
+				if val, ok := headers["Www-Authenticate"]; ok {
+					if got, want := val[0], "Basic realm=\""+expectRealm+"\""; got != want {
+						t.Errorf("Test %d: Www-Authenticate header should be '%s', got: '%s'", i, want, got)
+					}
+				} else {
+					t.Errorf("Test %d: response should have a 'Www-Authenticate' header", i)
 				}
 			} else {
-				t.Errorf("Test %d, should provide a header Www-Authenticate", i)
+				if req.Header.Get("Authorization") == "" {
+					// see issue #1508: https://github.com/mholt/caddy/issues/1508
+					t.Errorf("Test %d: Expected Authorization header to be retained after successful auth, but was empty", i)
+				}
 			}
 		}
-
 	}
-
 }
 
 func TestMultipleOverlappingRules(t *testing.T) {
@@ -121,7 +171,7 @@ md5:$apr1$l42y8rex$pOA2VJ0x/0TwaFeAF9nX61`
 
 	htfh, err := ioutil.TempFile("", "basicauth-")
 	if err != nil {
-		t.Skipf("Error creating temp file (%v), will skip htpassword test")
+		t.Skip("Error creating temp file, will skip htpassword test")
 		return
 	}
 	defer os.Remove(htfh.Name())

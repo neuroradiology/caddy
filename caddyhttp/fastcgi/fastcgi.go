@@ -1,18 +1,39 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package fastcgi has middleware that acts as a FastCGI client. Requests
 // that get forwarded to FastCGI stop the middleware execution chain.
 // The most common use for this package is to serve PHP websites via php-fpm.
 package fastcgi
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
+	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
 )
 
@@ -21,7 +42,6 @@ type Handler struct {
 	Next    httpserver.Handler
 	Rules   []Rule
 	Root    string
-	AbsRoot string // same as root, but absolute path
 	FileSys http.FileSystem
 
 	// These are sent to CGI scripts in env variables
@@ -31,17 +51,28 @@ type Handler struct {
 	ServerPort      string
 }
 
-// When a rewrite is performed, a header field of this name
-// is added to the request
-// It contains the original request URI before the rewrite.
-const internalRewriteFieldName = "Caddy-Rewrite-Original-URI"
-
 // ServeHTTP satisfies the httpserver.Handler interface.
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 	for _, rule := range h.Rules {
-
-		// First requirement: Base path must match and the path must be allowed.
-		if !httpserver.Path(r.URL.Path).Matches(rule.Path) || !rule.AllowedPath(r.URL.Path) {
+		// First requirement: Base path must match request path. If it doesn't,
+		// we check to make sure the leading slash is not missing, and if so,
+		// we check again with it prepended. This is in case people forget
+		// a leading slash when performing rewrites, and we don't want to expose
+		// the contents of the (likely PHP) script. See issue #1645.
+		hpath := httpserver.Path(r.URL.Path)
+		if !hpath.Matches(rule.Path) {
+			if strings.HasPrefix(string(hpath), "/") {
+				// this is a normal-looking path, and it doesn't match; try next rule
+				continue
+			}
+			hpath = httpserver.Path("/" + string(hpath)) // prepend leading slash
+			if !hpath.Matches(rule.Path) {
+				// even after fixing the request path, it still doesn't match; try next rule
+				continue
+			}
+		}
+		// The path must also be allowed (not ignored).
+		if !rule.AllowedPath(r.URL.Path) {
 			continue
 		}
 
@@ -77,26 +108,63 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 			}
 
 			// Connect to FastCGI gateway
-			fcgiBackend, err := rule.dialer.Dial()
+			address, err := rule.Address()
 			if err != nil {
 				return http.StatusBadGateway, err
 			}
+			network, address := parseAddress(address)
+
+			ctx := context.Background()
+			if rule.ConnectTimeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, rule.ConnectTimeout)
+				defer cancel()
+			}
+
+			fcgiBackend, err := DialContext(ctx, network, address)
+			if err != nil {
+				return http.StatusBadGateway, err
+			}
+			defer fcgiBackend.Close()
+
+			// read/write timeouts
+			if err := fcgiBackend.SetReadTimeout(rule.ReadTimeout); err != nil {
+				return http.StatusInternalServerError, err
+			}
+			if err := fcgiBackend.SetSendTimeout(rule.SendTimeout); err != nil {
+				return http.StatusInternalServerError, err
+			}
 
 			var resp *http.Response
-			contentLength, _ := strconv.Atoi(r.Header.Get("Content-Length"))
+
+			var contentLength int64
+			// if ContentLength is already set
+			if r.ContentLength > 0 {
+				contentLength = r.ContentLength
+			} else {
+				contentLength, _ = strconv.ParseInt(r.Header.Get("Content-Length"), 10, 64)
+			}
 			switch r.Method {
 			case "HEAD":
 				resp, err = fcgiBackend.Head(env)
 			case "GET":
-				resp, err = fcgiBackend.Get(env)
+				resp, err = fcgiBackend.Get(env, r.Body, contentLength)
 			case "OPTIONS":
 				resp, err = fcgiBackend.Options(env)
 			default:
 				resp, err = fcgiBackend.Post(env, r.Method, r.Header.Get("Content-Type"), r.Body, contentLength)
 			}
 
-			if err != nil && err != io.EOF {
-				return http.StatusBadGateway, err
+			if resp != nil && resp.Body != nil {
+				defer resp.Body.Close()
+			}
+
+			if err != nil {
+				if err, ok := err.(net.Error); ok && err.Timeout() {
+					return http.StatusGatewayTimeout, err
+				} else if err != io.EOF {
+					return http.StatusBadGateway, err
+				}
 			}
 
 			// Write response header
@@ -107,8 +175,6 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 			if err != nil {
 				return http.StatusBadGateway, err
 			}
-
-			defer rule.dialer.Close(fcgiBackend)
 
 			// Log any stderr output from upstream
 			if fcgiBackend.stderr.Len() != 0 {
@@ -174,7 +240,7 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 	var env map[string]string
 
 	// Get absolute path of requested resource
-	absPath := filepath.Join(h.AbsRoot, fpath)
+	absPath := filepath.Join(rule.Root, fpath)
 
 	// Separate remote IP and port; more lenient than net.SplitHostPort
 	var ip, port string
@@ -202,19 +268,24 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 	// Strip PATH_INFO from SCRIPT_NAME
 	scriptName = strings.TrimSuffix(scriptName, pathInfo)
 
-	// Get the request URI. The request URI might be as it came in over the wire,
-	// or it might have been rewritten internally by the rewrite middleware (see issue #256).
-	// If it was rewritten, there will be a header indicating the original URL,
-	// which is needed to get the correct RequestURI value for PHP apps.
-	reqURI := r.URL.RequestURI()
-	if origURI := r.Header.Get(internalRewriteFieldName); origURI != "" {
-		reqURI = origURI
-	}
+	// Add vhost path prefix to scriptName. Otherwise, some PHP software will
+	// have difficulty discovering its URL.
+	pathPrefix, _ := r.Context().Value(caddy.CtxKey("path_prefix")).(string)
+	scriptName = path.Join(pathPrefix, scriptName)
+
+	// Get the request URI from context. The context stores the original URI in case
+	// it was changed by a middleware such as rewrite. By default, we pass the
+	// original URI in as the value of REQUEST_URI (the user can overwrite this
+	// if desired). Most PHP apps seem to want the original URI. Besides, this is
+	// how nginx defaults: http://stackoverflow.com/a/12485156/1048862
+	reqURL, _ := r.Context().Value(httpserver.OriginalURLCtxKey).(url.URL)
+
+	// Retrieve name of remote user that was set by some downstream middleware such as basicauth.
+	remoteUser, _ := r.Context().Value(httpserver.RemoteUserCtxKey).(string)
 
 	// Some variables are unused but cleared explicitly to prevent
 	// the parent environment from interfering.
 	env = map[string]string{
-
 		// Variables defined in CGI 1.1 spec
 		"AUTH_TYPE":         "", // Not used
 		"CONTENT_LENGTH":    r.Header.Get("Content-Length"),
@@ -226,7 +297,7 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 		"REMOTE_HOST":       ip, // For speed, remote host lookups disabled
 		"REMOTE_PORT":       port,
 		"REMOTE_IDENT":      "", // Not used
-		"REMOTE_USER":       "", // Not used
+		"REMOTE_USER":       remoteUser,
 		"REQUEST_METHOD":    r.Method,
 		"SERVER_NAME":       h.ServerName,
 		"SERVER_PORT":       h.ServerPort,
@@ -234,19 +305,19 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 		"SERVER_SOFTWARE":   h.SoftwareName + "/" + h.SoftwareVersion,
 
 		// Other variables
-		"DOCUMENT_ROOT":   h.AbsRoot,
+		"DOCUMENT_ROOT":   rule.Root,
 		"DOCUMENT_URI":    docURI,
 		"HTTP_HOST":       r.Host, // added here, since not always part of headers
-		"REQUEST_URI":     reqURI,
+		"REQUEST_URI":     reqURL.RequestURI(),
 		"SCRIPT_FILENAME": scriptFilename,
 		"SCRIPT_NAME":     scriptName,
 	}
 
-	// compliance with the CGI specification that PATH_TRANSLATED
-	// should only exist if PATH_INFO is defined.
+	// compliance with the CGI specification requires that
+	// PATH_TRANSLATED should only exist if PATH_INFO is defined.
 	// Info: https://www.ietf.org/rfc/rfc3875 Page 14
 	if env["PATH_INFO"] != "" {
-		env["PATH_TRANSLATED"] = filepath.Join(h.AbsRoot, pathInfo) // Info: http://www.oreilly.com/openbook/cgi/ch02_04.html
+		env["PATH_TRANSLATED"] = filepath.Join(rule.Root, pathInfo) // Info: http://www.oreilly.com/openbook/cgi/ch02_04.html
 	}
 
 	// Some web apps rely on knowing HTTPS or not
@@ -254,18 +325,14 @@ func (h Handler) buildEnv(r *http.Request, rule Rule, fpath string) (map[string]
 		env["HTTPS"] = "on"
 	}
 
+	// Add env variables from config (with support for placeholders in values)
 	replacer := httpserver.NewReplacer(r, nil, "")
-	// Add env variables from config
 	for _, envVar := range rule.EnvVars {
-		// replace request placeholders in environment variables
 		env[envVar[0]] = replacer.Replace(envVar[1])
 	}
 
-	// Add all HTTP headers (except Caddy-Rewrite-Original-URI ) to env variables
+	// Add all HTTP headers to env variables
 	for field, val := range r.Header {
-		if strings.ToLower(field) == strings.ToLower(internalRewriteFieldName) {
-			continue
-		}
 		header := strings.ToUpper(field)
 		header = headerNameReplacer.Replace(header)
 		env["HTTP_"+header] = strings.Join(val, ", ")
@@ -279,11 +346,15 @@ type Rule struct {
 	// The base path to match. Required.
 	Path string
 
-	// The address of the FastCGI server. Required.
-	Address string
+	// upstream load balancer
+	balancer
 
 	// Always process files with this extension with fastcgi.
 	Ext string
+
+	// Use this directory as the fastcgi root directory. Defaults to the root
+	// directory of the parent virtual host.
+	Root string
 
 	// The path in the URL will be split into two, with the first piece ending
 	// with the value of SplitPath. The first piece will be assumed as the
@@ -301,8 +372,60 @@ type Rule struct {
 	// Ignored paths
 	IgnoredSubPaths []string
 
-	// FCGI dialer
-	dialer dialer
+	// The duration used to set a deadline when connecting to an upstream.
+	ConnectTimeout time.Duration
+
+	// The duration used to set a deadline when reading from the FastCGI server.
+	ReadTimeout time.Duration
+
+	// The duration used to set a deadline when sending to the FastCGI server.
+	SendTimeout time.Duration
+}
+
+// balancer is a fastcgi upstream load balancer.
+type balancer interface {
+	// Address picks an upstream address from the
+	// underlying load balancer.
+	Address() (string, error)
+}
+
+// roundRobin is a round robin balancer for fastcgi upstreams.
+type roundRobin struct {
+	// Known Go bug: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+	// must be first field for 64 bit alignment
+	// on x86 and arm.
+	index     int64
+	addresses []string
+}
+
+func (r *roundRobin) Address() (string, error) {
+	index := atomic.AddInt64(&r.index, 1) % int64(len(r.addresses))
+	return r.addresses[index], nil
+}
+
+// srvResolver is a private interface used to abstract
+// the DNS resolver. It is mainly used to facilitate testing.
+type srvResolver interface {
+	LookupSRV(ctx context.Context, service, proto, name string) (string, []*net.SRV, error)
+}
+
+// srv is a service locator for fastcgi upstreams
+type srv struct {
+	resolver srvResolver
+	service  string
+}
+
+// Address looks up the service and returns the address:port
+// from first result in resolved list.
+// No explicit balancing is required because net.LookupSRV
+// sorts the results by priority and randomizes within priority.
+func (s *srv) Address() (string, error) {
+	_, addrs, err := s.resolver.LookupSRV(context.Background(), "", "", s.service)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%s:%d", strings.TrimRight(addrs[0].Target, "."), addrs[0].Port), nil
 }
 
 // canSplit checks if path can split into two based on rule.SplitPath.

@@ -1,8 +1,23 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package fastcgi
 
 import (
+	"context"
 	"fmt"
-	"reflect"
+	"net"
 	"testing"
 
 	"github.com/mholt/caddy"
@@ -30,40 +45,17 @@ func TestSetup(t *testing.T) {
 	if myHandler.Rules[0].Path != "/" {
 		t.Errorf("Expected / as the Path")
 	}
-	if myHandler.Rules[0].Address != "127.0.0.1:9000" {
+	addr, err := myHandler.Rules[0].Address()
+	if err != nil {
+		t.Errorf("Unexpected error in trying to retrieve address: %s", err.Error())
+	}
+
+	if addr != "127.0.0.1:9000" {
 		t.Errorf("Expected 127.0.0.1:9000 as the Address")
 	}
-
-}
-
-func (p *persistentDialer) Equals(q *persistentDialer) bool {
-	if p.size != q.size {
-		return false
-	}
-	if p.network != q.network {
-		return false
-	}
-	if p.address != q.address {
-		return false
-	}
-
-	if len(p.pool) != len(q.pool) {
-		return false
-	}
-	for i, client := range p.pool {
-		if client != q.pool[i] {
-			return false
-		}
-	}
-	// ignore mutex state
-	return true
 }
 
 func TestFastcgiParse(t *testing.T) {
-	defaultAddress := "127.0.0.1:9001"
-	network, address := parseAddress(defaultAddress)
-	t.Logf("Address '%v' was parsed to network '%v' and address '%v'", defaultAddress, network, address)
-
 	tests := []struct {
 		inputFastcgiConfig    string
 		shouldErr             bool
@@ -73,68 +65,32 @@ func TestFastcgiParse(t *testing.T) {
 		{`fastcgi /blog 127.0.0.1:9000 php`,
 			false, []Rule{{
 				Path:       "/blog",
-				Address:    "127.0.0.1:9000",
+				balancer:   &roundRobin{addresses: []string{"127.0.0.1:9000"}},
 				Ext:        ".php",
 				SplitPath:  ".php",
-				dialer:     basicDialer{network: "tcp", address: "127.0.0.1:9000"},
 				IndexFiles: []string{"index.php"},
 			}}},
-		{`fastcgi / ` + defaultAddress + ` {
+		{`fastcgi / 127.0.0.1:9001 {
 	              split .html
 	              }`,
 			false, []Rule{{
 				Path:       "/",
-				Address:    defaultAddress,
+				balancer:   &roundRobin{addresses: []string{"127.0.0.1:9001"}},
 				Ext:        "",
 				SplitPath:  ".html",
-				dialer:     basicDialer{network: network, address: address},
 				IndexFiles: []string{},
 			}}},
-		{`fastcgi / ` + defaultAddress + ` {
+		{`fastcgi / 127.0.0.1:9001 {
 	              split .html
 	              except /admin /user
 	              }`,
 			false, []Rule{{
 				Path:            "/",
-				Address:         "127.0.0.1:9001",
+				balancer:        &roundRobin{addresses: []string{"127.0.0.1:9001"}},
 				Ext:             "",
 				SplitPath:       ".html",
-				dialer:          basicDialer{network: network, address: address},
 				IndexFiles:      []string{},
 				IgnoredSubPaths: []string{"/admin", "/user"},
-			}}},
-		{`fastcgi / ` + defaultAddress + ` {
-	              pool 0
-	              }`,
-			false, []Rule{{
-				Path:       "/",
-				Address:    defaultAddress,
-				Ext:        "",
-				SplitPath:  "",
-				dialer:     &persistentDialer{size: 0, network: network, address: address},
-				IndexFiles: []string{},
-			}}},
-		{`fastcgi / ` + defaultAddress + ` {
-	              pool 5
-	              }`,
-			false, []Rule{{
-				Path:       "/",
-				Address:    defaultAddress,
-				Ext:        "",
-				SplitPath:  "",
-				dialer:     &persistentDialer{size: 5, network: network, address: address},
-				IndexFiles: []string{},
-			}}},
-		{`fastcgi / ` + defaultAddress + ` {
-	              split .php
-	              }`,
-			false, []Rule{{
-				Path:       "/",
-				Address:    defaultAddress,
-				Ext:        "",
-				SplitPath:  ".php",
-				dialer:     basicDialer{network: network, address: address},
-				IndexFiles: []string{},
 			}}},
 	}
 	for i, test := range tests {
@@ -156,9 +112,19 @@ func TestFastcgiParse(t *testing.T) {
 					i, j, test.expectedFastcgiConfig[j].Path, actualFastcgiConfig.Path)
 			}
 
-			if actualFastcgiConfig.Address != test.expectedFastcgiConfig[j].Address {
+			actualAddr, err := actualFastcgiConfig.Address()
+			if err != nil {
+				t.Errorf("Test %d unexpected error in trying to retrieve %dth actual address: %s", i, j, err.Error())
+			}
+
+			expectedAddr, err := test.expectedFastcgiConfig[j].Address()
+			if err != nil {
+				t.Errorf("Test %d unexpected error in trying to retrieve %dth expected address: %s", i, j, err.Error())
+			}
+
+			if actualAddr != expectedAddr {
 				t.Errorf("Test %d expected %dth FastCGI Address to be  %s  , but got %s",
-					i, j, test.expectedFastcgiConfig[j].Address, actualFastcgiConfig.Address)
+					i, j, expectedAddr, actualAddr)
 			}
 
 			if actualFastcgiConfig.Ext != test.expectedFastcgiConfig[j].Ext {
@@ -169,29 +135,6 @@ func TestFastcgiParse(t *testing.T) {
 			if actualFastcgiConfig.SplitPath != test.expectedFastcgiConfig[j].SplitPath {
 				t.Errorf("Test %d expected %dth FastCGI SplitPath to be  %s  , but got %s",
 					i, j, test.expectedFastcgiConfig[j].SplitPath, actualFastcgiConfig.SplitPath)
-			}
-
-			if reflect.TypeOf(actualFastcgiConfig.dialer) != reflect.TypeOf(test.expectedFastcgiConfig[j].dialer) {
-				t.Errorf("Test %d expected %dth FastCGI dialer to be of type %T, but got %T",
-					i, j, test.expectedFastcgiConfig[j].dialer, actualFastcgiConfig.dialer)
-			} else {
-				equal := true
-				switch actual := actualFastcgiConfig.dialer.(type) {
-				case basicDialer:
-					equal = actualFastcgiConfig.dialer == test.expectedFastcgiConfig[j].dialer
-				case *persistentDialer:
-					if expected, ok := test.expectedFastcgiConfig[j].dialer.(*persistentDialer); ok {
-						equal = actual.Equals(expected)
-					} else {
-						equal = false
-					}
-				default:
-					t.Errorf("Unkonw dialer type %T", actualFastcgiConfig.dialer)
-				}
-				if !equal {
-					t.Errorf("Test %d expected %dth FastCGI dialer to be %v, but got %v",
-						i, j, test.expectedFastcgiConfig[j].dialer, actualFastcgiConfig.dialer)
-				}
 			}
 
 			if fmt.Sprint(actualFastcgiConfig.IndexFiles) != fmt.Sprint(test.expectedFastcgiConfig[j].IndexFiles) {
@@ -206,4 +149,76 @@ func TestFastcgiParse(t *testing.T) {
 		}
 	}
 
+}
+
+func TestFastCGIResolveSRV(t *testing.T) {
+	tests := []struct {
+		inputFastcgiConfig string
+		locator            string
+		target             string
+		port               uint16
+		shouldErr          bool
+	}{
+		{
+			`fastcgi / srv://fpm.tcp.service.consul {
+				upstream yolo
+			}`,
+			"fpm.tcp.service.consul",
+			"127.0.0.1",
+			9000,
+			true,
+		},
+		{
+			`fastcgi / srv://fpm.tcp.service.consul`,
+			"fpm.tcp.service.consul",
+			"127.0.0.1",
+			9000,
+			false,
+		},
+	}
+
+	for i, test := range tests {
+		actualFastcgiConfigs, err := fastcgiParse(caddy.NewTestController("http", test.inputFastcgiConfig))
+
+		if err == nil && test.shouldErr {
+			t.Errorf("Test %d didn't error, but it should have", i)
+		} else if err != nil && !test.shouldErr {
+			t.Errorf("Test %d errored, but it shouldn't have; got '%v'", i, err)
+		}
+
+		for _, actualFastcgiConfig := range actualFastcgiConfigs {
+			resolver, ok := (actualFastcgiConfig.balancer).(*srv)
+			if !ok {
+				t.Errorf("Test %d upstream balancer is not srv", i)
+			}
+			resolver.resolver = buildTestResolver(test.target, test.port)
+
+			addr, err := actualFastcgiConfig.Address()
+			if err != nil {
+				t.Errorf("Test %d failed to retrieve upstream address. %s", i, err.Error())
+			}
+
+			expectedAddr := fmt.Sprintf("%s:%d", test.target, test.port)
+			if addr != expectedAddr {
+				t.Errorf("Test %d expected upstream address to be %s, got %s", i, expectedAddr, addr)
+			}
+		}
+	}
+}
+
+func buildTestResolver(target string, port uint16) srvResolver {
+	return &testSRVResolver{target, port}
+}
+
+type testSRVResolver struct {
+	target string
+	port   uint16
+}
+
+func (r *testSRVResolver) LookupSRV(ctx context.Context, service, proto, name string) (string, []*net.SRV, error) {
+	return "", []*net.SRV{
+		{Target: r.target,
+			Port:     r.port,
+			Priority: 1,
+			Weight:   1}}, nil
 }

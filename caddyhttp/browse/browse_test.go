@@ -1,19 +1,41 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package browse
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
 
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+	"github.com/mholt/caddy/caddyhttp/staticfiles"
 )
+
+const testDirPrefix = "caddy_browse_test"
 
 func TestSort(t *testing.T) {
 	// making up []fileInfo with bogus values;
@@ -68,6 +90,13 @@ func TestSort(t *testing.T) {
 		t.Errorf("The listing isn't time sorted: %v", listing.Items)
 	}
 
+	// sort by name dir first
+	listing.Sort = "namedirfirst"
+	listing.applySort()
+	if !sort.IsSorted(byNameDirFirst(listing)) {
+		t.Errorf("The listing isn't namedirfirst sorted: %v", listing.Items)
+	}
+
 	// reverse by name
 	listing.Sort = "name"
 	listing.Order = "desc"
@@ -91,6 +120,14 @@ func TestSort(t *testing.T) {
 	if !isReversed(byTime(listing)) {
 		t.Errorf("The listing isn't reversed by time: %v", listing.Items)
 	}
+
+	// reverse by name dir first
+	listing.Sort = "namedirfirst"
+	listing.Order = "desc"
+	listing.applySort()
+	if !isReversed(byNameDirFirst(listing)) {
+		t.Errorf("The listing isn't reversed by namedirfirst: %v", listing.Items)
+	}
 }
 
 func TestBrowseHTTPMethods(t *testing.T) {
@@ -106,8 +143,10 @@ func TestBrowseHTTPMethods(t *testing.T) {
 		Configs: []Config{
 			{
 				PathScope: "/photos",
-				Root:      http.Dir("./testdata"),
-				Template:  tmpl,
+				Fs: staticfiles.FileServer{
+					Root: http.Dir("./testdata"),
+				},
+				Template: tmpl,
 			},
 		},
 	}
@@ -123,6 +162,8 @@ func TestBrowseHTTPMethods(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Test: Could not create HTTP request: %v", err)
 		}
+		ctx := context.WithValue(req.Context(), httpserver.OriginalURLCtxKey, *req.URL)
+		req = req.WithContext(ctx)
 
 		code, _ := b.ServeHTTP(rec, req)
 		if code != expected {
@@ -145,8 +186,11 @@ func TestBrowseTemplate(t *testing.T) {
 		Configs: []Config{
 			{
 				PathScope: "/photos",
-				Root:      http.Dir("./testdata"),
-				Template:  tmpl,
+				Fs: staticfiles.FileServer{
+					Root: http.Dir("./testdata"),
+					Hide: []string{"photos/hidden.html"},
+				},
+				Template: tmpl,
 			},
 		},
 	}
@@ -155,6 +199,8 @@ func TestBrowseTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Test: Could not create HTTP request: %v", err)
 	}
+	ctx := context.WithValue(req.Context(), httpserver.OriginalURLCtxKey, *req.URL)
+	req = req.WithContext(ctx)
 
 	rec := httptest.NewRecorder()
 
@@ -174,6 +220,8 @@ func TestBrowseTemplate(t *testing.T) {
 
 <h1>/photos/</h1>
 
+<a href="./test1/">test1</a><br>
+
 <a href="./test.html">test.html</a><br>
 
 <a href="./test2.html">test2.html</a><br>
@@ -185,7 +233,7 @@ func TestBrowseTemplate(t *testing.T) {
 `
 
 	if respBody != expectedBody {
-		t.Fatalf("Expected body: %v got: %v", expectedBody, respBody)
+		t.Fatalf("Expected body: '%v' got: '%v'", expectedBody, respBody)
 	}
 
 }
@@ -193,13 +241,15 @@ func TestBrowseTemplate(t *testing.T) {
 func TestBrowseJson(t *testing.T) {
 	b := Browse{
 		Next: httpserver.HandlerFunc(func(w http.ResponseWriter, r *http.Request) (int, error) {
-			t.Fatalf("Next shouldn't be called")
+			t.Fatalf("Next shouldn't be called: %s", r.URL)
 			return 0, nil
 		}),
 		Configs: []Config{
 			{
 				PathScope: "/photos/",
-				Root:      http.Dir("./testdata"),
+				Fs: staticfiles.FileServer{
+					Root: http.Dir("./testdata"),
+				},
 			},
 		},
 	}
@@ -246,6 +296,9 @@ func TestBrowseJson(t *testing.T) {
 			Mode:    f.Mode(),
 		})
 	}
+
+	// Test that sort=name returns correct listing.
+
 	listing := Listing{Items: fileinfos} // this listing will be used for validation inside the tests
 
 	tests := []struct {
@@ -258,33 +311,33 @@ func TestBrowseJson(t *testing.T) {
 	}{
 		//test case 1: testing for default sort and  order and without the limit parameter, default sort is by name and the default order is ascending
 		//without the limit query entire listing will be produced
-		{"/", "", "", -1, false, listing.Items},
+		{"/?sort=name", "", "", -1, false, listing.Items},
 		//test case 2: limit is set to 1, orderBy and sortBy is default
-		{"/?limit=1", "", "", 1, false, listing.Items[:1]},
+		{"/?limit=1&sort=name", "", "", 1, false, listing.Items[:1]},
 		//test case 3 : if the listing request is bigger than total size of listing then it should return everything
-		{"/?limit=100000000", "", "", 100000000, false, listing.Items},
+		{"/?limit=100000000&sort=name", "", "", 100000000, false, listing.Items},
 		//test case 4 : testing for negative limit
-		{"/?limit=-1", "", "", -1, false, listing.Items},
+		{"/?limit=-1&sort=name", "", "", -1, false, listing.Items},
 		//test case 5 : testing with limit set to -1 and order set to descending
-		{"/?limit=-1&order=desc", "", "desc", -1, false, listing.Items},
+		{"/?limit=-1&order=desc&sort=name", "", "desc", -1, false, listing.Items},
 		//test case 6 : testing with limit set to 2 and order set to descending
-		{"/?limit=2&order=desc", "", "desc", 2, false, listing.Items},
+		{"/?limit=2&order=desc&sort=name", "", "desc", 2, false, listing.Items},
 		//test case 7 : testing with limit set to 3 and order set to descending
-		{"/?limit=3&order=desc", "", "desc", 3, false, listing.Items},
+		{"/?limit=3&order=desc&sort=name", "", "desc", 3, false, listing.Items},
 		//test case 8 : testing with limit set to 3 and order set to ascending
-		{"/?limit=3&order=asc", "", "asc", 3, false, listing.Items},
+		{"/?limit=3&order=asc&sort=name", "", "asc", 3, false, listing.Items},
 		//test case 9 : testing with limit set to 1111111 and order set to ascending
-		{"/?limit=1111111&order=asc", "", "asc", 1111111, false, listing.Items},
+		{"/?limit=1111111&order=asc&sort=name", "", "asc", 1111111, false, listing.Items},
 		//test case 10 : testing with limit set to default and order set to ascending and sorting by size
-		{"/?order=asc&sort=size", "size", "asc", -1, false, listing.Items},
+		{"/?order=asc&sort=size&sort=name", "size", "asc", -1, false, listing.Items},
 		//test case 11 : testing with limit set to default and order set to ascending and sorting by last modified
-		{"/?order=asc&sort=time", "time", "asc", -1, false, listing.Items},
+		{"/?order=asc&sort=time&sort=name", "time", "asc", -1, false, listing.Items},
 		//test case 12 : testing with limit set to 1 and order set to ascending and sorting by last modified
-		{"/?order=asc&sort=time&limit=1", "time", "asc", 1, false, listing.Items},
+		{"/?order=asc&sort=time&limit=1&sort=name", "time", "asc", 1, false, listing.Items},
 		//test case 13 : testing with limit set to -100 and order set to ascending and sorting by last modified
-		{"/?order=asc&sort=time&limit=-100", "time", "asc", -100, false, listing.Items},
+		{"/?order=asc&sort=time&limit=-100&sort=name", "time", "asc", -100, false, listing.Items},
 		//test case 14 : testing with limit set to -100 and order set to ascending and sorting by size
-		{"/?order=asc&sort=size&limit=-100", "size", "asc", -100, false, listing.Items},
+		{"/?order=asc&sort=size&limit=-100&sort=name", "size", "asc", -100, false, listing.Items},
 	}
 
 	for i, test := range tests {
@@ -293,6 +346,8 @@ func TestBrowseJson(t *testing.T) {
 		if err != nil && !test.shouldErr {
 			t.Errorf("Test %d errored when making request, but it shouldn't have; got '%v'", i, err)
 		}
+		ctx := context.WithValue(req.Context(), httpserver.OriginalURLCtxKey, *req.URL)
+		req = req.WithContext(ctx)
 
 		req.Header.Set("Accept", "application/json")
 		rec := httptest.NewRecorder()
@@ -353,4 +408,218 @@ func isReversed(data sort.Interface) bool {
 		}
 	}
 	return true
+}
+
+func TestBrowseRedirect(t *testing.T) {
+	testCases := []struct {
+		url        string
+		statusCode int
+		returnCode int
+		location   string
+	}{
+		{
+			"http://www.example.com/photos",
+			http.StatusMovedPermanently,
+			http.StatusMovedPermanently,
+			"http://www.example.com/photos/",
+		},
+		{
+			"/photos",
+			http.StatusMovedPermanently,
+			http.StatusMovedPermanently,
+			"/photos/",
+		},
+	}
+
+	for i, tc := range testCases {
+		b := Browse{
+			Next: httpserver.HandlerFunc(func(w http.ResponseWriter, r *http.Request) (int, error) {
+				t.Fatalf("Test %d - Next shouldn't be called", i)
+				return 0, nil
+			}),
+			Configs: []Config{
+				{
+					PathScope: "/photos",
+					Fs: staticfiles.FileServer{
+						Root: http.Dir("./testdata"),
+					},
+				},
+			},
+		}
+
+		req, err := http.NewRequest("GET", tc.url, nil)
+		if err != nil {
+			t.Fatalf("Test %d - could not create HTTP request: %v", i, err)
+		}
+		ctx := context.WithValue(req.Context(), httpserver.OriginalURLCtxKey, *req.URL)
+		req = req.WithContext(ctx)
+
+		rec := httptest.NewRecorder()
+
+		returnCode, _ := b.ServeHTTP(rec, req)
+		if returnCode != tc.returnCode {
+			t.Fatalf("Test %d - wrong return code, expected %d, got %d",
+				i, tc.returnCode, returnCode)
+		}
+
+		if got := rec.Code; got != tc.statusCode {
+			t.Errorf("Test %d - wrong status, expected %d, got %d",
+				i, tc.statusCode, got)
+		}
+
+		if got := rec.Header().Get("Location"); got != tc.location {
+			t.Errorf("Test %d - wrong Location header, expected %s, got %s",
+				i, tc.location, got)
+		}
+	}
+}
+
+func TestDirSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows support for symlinks is limited, and we had a hard time getting
+		// all these tests to pass with the permissions of CI; so just skip them
+		fmt.Println("Skipping browse symlink tests on Windows...")
+		return
+	}
+
+	testCases := []struct {
+		source       string
+		target       string
+		pathScope    string
+		url          string
+		expectedName string
+		expectedURL  string
+	}{
+		// test case can expect a directory "dir" and a symlink to it called "symlink"
+
+		{"dir", "$TMP/rel_symlink_to_dir", "/", "/",
+			"rel_symlink_to_dir", "./rel_symlink_to_dir/"},
+		{"$TMP/dir", "$TMP/abs_symlink_to_dir", "/", "/",
+			"abs_symlink_to_dir", "./abs_symlink_to_dir/"},
+
+		{"../../dir", "$TMP/sub/dir/rel_symlink_to_dir", "/", "/sub/dir/",
+			"rel_symlink_to_dir", "./rel_symlink_to_dir/"},
+		{"$TMP/dir", "$TMP/sub/dir/abs_symlink_to_dir", "/", "/sub/dir/",
+			"abs_symlink_to_dir", "./abs_symlink_to_dir/"},
+
+		{"../../dir", "$TMP/with/scope/rel_symlink_to_dir", "/with/scope", "/with/scope/",
+			"rel_symlink_to_dir", "./rel_symlink_to_dir/"},
+		{"$TMP/dir", "$TMP/with/scope/abs_symlink_to_dir", "/with/scope", "/with/scope/",
+			"abs_symlink_to_dir", "./abs_symlink_to_dir/"},
+
+		{"../../../../dir", "$TMP/with/scope/sub/dir/rel_symlink_to_dir", "/with/scope", "/with/scope/sub/dir/",
+			"rel_symlink_to_dir", "./rel_symlink_to_dir/"},
+		{"$TMP/dir", "$TMP/with/scope/sub/dir/abs_symlink_to_dir", "/with/scope", "/with/scope/sub/dir/",
+			"abs_symlink_to_dir", "./abs_symlink_to_dir/"},
+
+		{"symlink", "$TMP/rel_symlink_to_symlink", "/", "/",
+			"rel_symlink_to_symlink", "./rel_symlink_to_symlink/"},
+		{"$TMP/symlink", "$TMP/abs_symlink_to_symlink", "/", "/",
+			"abs_symlink_to_symlink", "./abs_symlink_to_symlink/"},
+
+		{"../../symlink", "$TMP/sub/dir/rel_symlink_to_symlink", "/", "/sub/dir/",
+			"rel_symlink_to_symlink", "./rel_symlink_to_symlink/"},
+		{"$TMP/symlink", "$TMP/sub/dir/abs_symlink_to_symlink", "/", "/sub/dir/",
+			"abs_symlink_to_symlink", "./abs_symlink_to_symlink/"},
+
+		{"../../symlink", "$TMP/with/scope/rel_symlink_to_symlink", "/with/scope", "/with/scope/",
+			"rel_symlink_to_symlink", "./rel_symlink_to_symlink/"},
+		{"$TMP/symlink", "$TMP/with/scope/abs_symlink_to_symlink", "/with/scope", "/with/scope/",
+			"abs_symlink_to_symlink", "./abs_symlink_to_symlink/"},
+
+		{"../../../../symlink", "$TMP/with/scope/sub/dir/rel_symlink_to_symlink", "/with/scope", "/with/scope/sub/dir/",
+			"rel_symlink_to_symlink", "./rel_symlink_to_symlink/"},
+		{"$TMP/symlink", "$TMP/with/scope/sub/dir/abs_symlink_to_symlink", "/with/scope", "/with/scope/sub/dir/",
+			"abs_symlink_to_symlink", "./abs_symlink_to_symlink/"},
+	}
+
+	for i, tc := range testCases {
+		func() {
+			tmpdir, err := ioutil.TempDir("", testDirPrefix)
+			if err != nil {
+				t.Fatalf("failed to create test directory: %v", err)
+			}
+			defer os.RemoveAll(tmpdir)
+
+			if err := os.MkdirAll(filepath.Join(tmpdir, "dir"), 0755); err != nil {
+				t.Fatalf("failed to create test dir 'dir': %v", err)
+			}
+			if err := os.Symlink("dir", filepath.Join(tmpdir, "symlink")); err != nil {
+				t.Fatalf("failed to create test symlink 'symlink': %v", err)
+			}
+
+			sourceResolved := strings.Replace(tc.source, "$TMP", tmpdir, -1)
+			targetResolved := strings.Replace(tc.target, "$TMP", tmpdir, -1)
+
+			if err := os.MkdirAll(filepath.Dir(sourceResolved), 0755); err != nil {
+				t.Fatalf("failed to create source symlink dir: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(targetResolved), 0755); err != nil {
+				t.Fatalf("failed to create target symlink dir: %v", err)
+			}
+			if err := os.Symlink(sourceResolved, targetResolved); err != nil {
+				t.Fatalf("failed to create test symlink: %v", err)
+			}
+
+			b := Browse{
+				Next: httpserver.HandlerFunc(func(w http.ResponseWriter, r *http.Request) (int, error) {
+					t.Fatalf("Test %d - Next shouldn't be called", i)
+					return 0, nil
+				}),
+				Configs: []Config{
+					{
+						PathScope: tc.pathScope,
+						Fs: staticfiles.FileServer{
+							Root: http.Dir(tmpdir),
+						},
+					},
+				},
+			}
+
+			req, err := http.NewRequest("GET", tc.url, nil)
+			req.Header.Add("Accept", "application/json")
+			if err != nil {
+				t.Fatalf("Test %d - could not create HTTP request: %v", i, err)
+			}
+
+			rec := httptest.NewRecorder()
+
+			returnCode, _ := b.ServeHTTP(rec, req)
+			if returnCode != http.StatusOK {
+				t.Fatalf("Test %d - wrong return code, expected %d, got %d",
+					i, http.StatusOK, returnCode)
+			}
+
+			type jsonEntry struct {
+				Name      string
+				IsDir     bool
+				IsSymlink bool
+				URL       string
+			}
+			var entries []jsonEntry
+			if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+				t.Fatalf("Test %d - failed to parse json: %v", i, err)
+			}
+
+			found := false
+			for _, e := range entries {
+				if e.Name != tc.expectedName {
+					continue
+				}
+				found = true
+				if !e.IsDir {
+					t.Errorf("Test %d - expected to be a dir, got %v", i, e.IsDir)
+				}
+				if !e.IsSymlink {
+					t.Errorf("Test %d - expected to be a symlink, got %v", i, e.IsSymlink)
+				}
+				if e.URL != tc.expectedURL {
+					t.Errorf("Test %d - wrong URL, expected %v, got %v", i, tc.expectedURL, e.URL)
+				}
+			}
+			if !found {
+				t.Errorf("Test %d - failed, could not find name %v", i, tc.expectedName)
+			}
+		}()
+	}
 }

@@ -1,11 +1,23 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package header provides middleware that appends headers to
 // requests based on a set of configuration rules that define
 // which routes receive which headers.
 package header
 
 import (
-	"bufio"
-	"net"
 	"net/http"
 	"strings"
 
@@ -23,18 +35,26 @@ type Headers struct {
 // setting headers on the response according to the configured rules.
 func (h Headers) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 	replacer := httpserver.NewReplacer(r, nil, "")
-	rww := &responseWriterWrapper{w: w}
+	rww := &responseWriterWrapper{
+		ResponseWriterWrapper: &httpserver.ResponseWriterWrapper{ResponseWriter: w},
+	}
 	for _, rule := range h.Rules {
 		if httpserver.Path(r.URL.Path).Matches(rule.Path) {
-			for _, header := range rule.Headers {
+			for name := range rule.Headers {
+
 				// One can either delete a header, add multiple values to a header, or simply
 				// set a header.
-				if strings.HasPrefix(header.Name, "-") {
-					rww.delHeader(strings.TrimLeft(header.Name, "-"))
-				} else if strings.HasPrefix(header.Name, "+") {
-					rww.addHeader(strings.TrimLeft(header.Name, "+"), replacer.Replace(header.Value))
+
+				if strings.HasPrefix(name, "-") {
+					rww.delHeader(strings.TrimLeft(name, "-"))
+				} else if strings.HasPrefix(name, "+") {
+					for _, value := range rule.Headers[name] {
+						rww.Header().Add(strings.TrimLeft(name, "+"), replacer.Replace(value))
+					}
 				} else {
-					rww.setHeader(header.Name, replacer.Replace(header.Value))
+					for _, value := range rule.Headers[name] {
+						rww.Header().Set(name, replacer.Replace(value))
+					}
 				}
 			}
 		}
@@ -44,16 +64,9 @@ func (h Headers) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 
 type (
 	// Rule groups a slice of HTTP headers by a URL pattern.
-	// TODO: use http.Header type instead?
 	Rule struct {
 		Path    string
-		Headers []Header
-	}
-
-	// Header represents a single HTTP header, simply a name and value.
-	Header struct {
-		Name  string
-		Value string
+		Headers http.Header
 	}
 )
 
@@ -63,20 +76,20 @@ type headerOperation func(http.Header)
 // responseWriterWrapper wraps the real ResponseWriter.
 // It defers header operations until writeHeader
 type responseWriterWrapper struct {
-	w           http.ResponseWriter
+	*httpserver.ResponseWriterWrapper
 	ops         []headerOperation
 	wroteHeader bool
 }
 
 func (rww *responseWriterWrapper) Header() http.Header {
-	return rww.w.Header()
+	return rww.ResponseWriterWrapper.Header()
 }
 
 func (rww *responseWriterWrapper) Write(d []byte) (int, error) {
 	if !rww.wroteHeader {
 		rww.WriteHeader(http.StatusOK)
 	}
-	return rww.w.Write(d)
+	return rww.ResponseWriterWrapper.Write(d)
 }
 
 func (rww *responseWriterWrapper) WriteHeader(status int) {
@@ -92,35 +105,20 @@ func (rww *responseWriterWrapper) WriteHeader(status int) {
 		op(h)
 	}
 
-	rww.w.WriteHeader(status)
+	rww.ResponseWriterWrapper.WriteHeader(status)
 }
 
-// addHeader registers a http.Header.Add operation
-func (rww *responseWriterWrapper) addHeader(key, value string) {
-	rww.ops = append(rww.ops, func(h http.Header) {
-		h.Add(key, value)
-	})
-}
-
-// delHeader registers a http.Header.Del operation
+// delHeader deletes the existing header according to the key
+// Also it will delete that header added later.
 func (rww *responseWriterWrapper) delHeader(key string) {
+	// remove the existing one if any
+	rww.Header().Del(key)
+
+	// register a future deletion
 	rww.ops = append(rww.ops, func(h http.Header) {
 		h.Del(key)
 	})
 }
 
-// setHeader registers a http.Header.Set operation
-func (rww *responseWriterWrapper) setHeader(key, value string) {
-	rww.ops = append(rww.ops, func(h http.Header) {
-		h.Set(key, value)
-	})
-}
-
-// Hijack implements http.Hijacker. It simply wraps the underlying
-// ResponseWriter's Hijack method if there is one, or returns an error.
-func (rww *responseWriterWrapper) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if hj, ok := rww.w.(http.Hijacker); ok {
-		return hj.Hijack()
-	}
-	return nil, nil, httpserver.NonHijackerError{Underlying: rww.w}
-}
+// Interface guards
+var _ httpserver.HTTPInterfaces = (*responseWriterWrapper)(nil)

@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package caddytls
 
 import (
@@ -118,11 +132,7 @@ func getUser(storage Storage, email string) (User, error) {
 
 	// load their private key
 	user.key, err = loadPrivateKey(userData.Key)
-	if err != nil {
-		return user, err
-	}
-
-	return user, nil
+	return user, err
 }
 
 // saveUser persists a user's key and account registration
@@ -175,6 +185,6 @@ var stdin = io.ReadWriter(os.Stdin)
 // address was not provided; default 'username' if you will.
 const emptyEmail = "default"
 
-// TODO: After Boulder implements the 'meta' field of the directoy,
+// TODO: After Boulder implements the 'meta' field of the directory,
 // we can get this link dynamically.
 const saURL = "https://acme-v01.api.letsencrypt.org/terms"

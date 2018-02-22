@@ -1,7 +1,23 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package header
 
 import (
 	"fmt"
+	"net/http"
+	"reflect"
 	"testing"
 
 	"github.com/mholt/caddy"
@@ -39,17 +55,29 @@ func TestHeadersParse(t *testing.T) {
 	}{
 		{`header /foo Foo "Bar Baz"`,
 			false, []Rule{
-				{Path: "/foo", Headers: []Header{
-					{Name: "Foo", Value: "Bar Baz"},
+				{Path: "/foo", Headers: http.Header{
+					"Foo": []string{"Bar Baz"},
 				}},
 			}},
-		{`header /bar { Foo "Bar Baz" Baz Qux }`,
+		{`header /bar {
+			Foo "Bar Baz"
+			Baz Qux
+			Foobar
+		}`,
 			false, []Rule{
-				{Path: "/bar", Headers: []Header{
-					{Name: "Foo", Value: "Bar Baz"},
-					{Name: "Baz", Value: "Qux"},
+				{Path: "/bar", Headers: http.Header{
+					"Foo":    []string{"Bar Baz"},
+					"Baz":    []string{"Qux"},
+					"Foobar": []string{""},
 				}},
 			}},
+		{`header /foo {
+				Foo Bar Baz
+			}`, true,
+			[]Rule{}},
+		{`header /foo {
+				Test "max-age=1814400";
+			}`, true, []Rule{}},
 	}
 
 	for i, test := range tests {
@@ -77,7 +105,7 @@ func TestHeadersParse(t *testing.T) {
 			expectedHeaders := fmt.Sprintf("%v", expectedRule.Headers)
 			actualHeaders := fmt.Sprintf("%v", actualRule.Headers)
 
-			if actualHeaders != expectedHeaders {
+			if !reflect.DeepEqual(actualRule.Headers, expectedRule.Headers) {
 				t.Errorf("Test %d, rule %d: Expected headers %s, but got %s",
 					i, j, expectedHeaders, actualHeaders)
 			}

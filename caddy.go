@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Package caddy implements the Caddy server manager.
 //
 // To use this package:
@@ -5,6 +19,8 @@
 //   1. Set the AppName and AppVersion variables.
 //   2. Call LoadCaddyfile() to get the Caddyfile.
 //      Pass in the name of the server type (like "http").
+//      Make sure the server type's package is imported
+//      (import _ "github.com/mholt/caddy/caddyhttp").
 //   3. Call caddy.Start() to start Caddy. You get back
 //      an Instance, on which you can call Restart() to
 //      restart it or Stop() to stop it.
@@ -15,6 +31,7 @@ package caddy
 
 import (
 	"bytes"
+	"encoding/gob"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -49,7 +66,7 @@ var (
 	// isUpgrade will be set to true if this process
 	// was started as part of an upgrade, where a parent
 	// Caddy process started this one.
-	isUpgrade bool
+	isUpgrade = os.Getenv("CADDY__UPGRADE") == "1"
 
 	// started will be set to true when the first
 	// instance is started; it never gets set to
@@ -60,8 +77,18 @@ var (
 	mu sync.Mutex
 )
 
+func init() {
+	OnProcessExit = append(OnProcessExit, func() {
+		if PidFile != "" {
+			os.Remove(PidFile)
+		}
+	})
+}
+
 // Instance contains the state of servers created as a result of
 // calling Start and can be used to access or control those servers.
+// It is literally an instance of a server type. Instance values
+// should NOT be copied. Use *Instance for safety.
 type Instance struct {
 	// serverType is the name of the instance's server type
 	serverType string
@@ -72,10 +99,11 @@ type Instance struct {
 	// wg is used to wait for all servers to shut down
 	wg *sync.WaitGroup
 
-	// context is the context created for this instance.
+	// context is the context created for this instance,
+	// used to coordinate the setting up of the server type
 	context Context
 
-	// servers is the list of servers with their listeners.
+	// servers is the list of servers with their listeners
 	servers []ServerListener
 
 	// these callbacks execute when certain events occur
@@ -84,6 +112,18 @@ type Instance struct {
 	onRestart       []func() error // before restart commences
 	onShutdown      []func() error // stopping, even as part of a restart
 	onFinalShutdown []func() error // stopping, not as part of a restart
+
+	// storing values on an instance is preferable to
+	// global state because these will get garbage-
+	// collected after in-process reloads when the
+	// old instances are destroyed; use StorageMu
+	// to access this value safely
+	Storage   map[interface{}]interface{}
+	StorageMu sync.RWMutex
+}
+
+func Instances() []*Instance {
+	return instances
 }
 
 // Servers returns the ServerListeners in i.
@@ -179,7 +219,7 @@ func (i *Instance) Restart(newCaddyfile Input) (*Instance, error) {
 	}
 
 	// create new instance; if the restart fails, it is simply discarded
-	newInst := &Instance{serverType: newCaddyfile.ServerType(), wg: i.wg}
+	newInst := &Instance{serverType: newCaddyfile.ServerType(), wg: i.wg, Storage: make(map[interface{}]interface{})}
 
 	// attempt to start new instance
 	err := startWithListenerFds(newCaddyfile, newInst, restartFds)
@@ -189,12 +229,18 @@ func (i *Instance) Restart(newCaddyfile Input) (*Instance, error) {
 
 	// success! stop the old instance
 	for _, shutdownFunc := range i.onShutdown {
-		err := shutdownFunc()
+		err = shutdownFunc()
 		if err != nil {
 			return i, err
 		}
 	}
-	i.Stop()
+	err = i.Stop()
+	if err != nil {
+		return i, err
+	}
+
+	// Execute instantiation events
+	EmitEvent(InstanceStartupEvent, newInst)
 
 	log.Println("[INFO] Reloading complete")
 
@@ -232,7 +278,7 @@ func HasListenerWithAddress(addr string) bool {
 func listenerAddrEqual(ln net.Listener, addr string) bool {
 	lnAddr := ln.Addr().String()
 	hostname, port, err := net.SplitHostPort(addr)
-	if err != nil || hostname != "" {
+	if err != nil {
 		return lnAddr == addr
 	}
 	if lnAddr == net.JoinHostPort("::", port) {
@@ -241,7 +287,7 @@ func listenerAddrEqual(ln net.Listener, addr string) bool {
 	if lnAddr == net.JoinHostPort("0.0.0.0", port) {
 		return true
 	}
-	return false
+	return hostname != "" && lnAddr == addr
 }
 
 // TCPServer is a type that can listen and serve connections.
@@ -358,6 +404,16 @@ type AfterStartup interface {
 // is returned. Consequently, this function never returns a nil
 // value as long as there are no errors.
 func LoadCaddyfile(serverType string) (Input, error) {
+	// If we are finishing an upgrade, we must obtain the Caddyfile
+	// from our parent process, regardless of configured loaders.
+	if IsUpgrade() {
+		err := gob.NewDecoder(os.Stdin).Decode(&loadedGob)
+		if err != nil {
+			return nil, err
+		}
+		return loadedGob.Caddyfile, nil
+	}
+
 	// Ask plugged-in loaders for a Caddyfile
 	cdyfile, err := loadCaddyfileInput(serverType)
 	if err != nil {
@@ -422,14 +478,117 @@ func (i *Instance) Caddyfile() Input {
 //
 // This function blocks until all the servers are listening.
 func Start(cdyfile Input) (*Instance, error) {
-	writePidFile()
-	inst := &Instance{serverType: cdyfile.ServerType(), wg: new(sync.WaitGroup)}
-	return inst, startWithListenerFds(cdyfile, inst, nil)
+	inst := &Instance{serverType: cdyfile.ServerType(), wg: new(sync.WaitGroup), Storage: make(map[interface{}]interface{})}
+	err := startWithListenerFds(cdyfile, inst, nil)
+	if err != nil {
+		return inst, err
+	}
+	signalSuccessToParent()
+	if pidErr := writePidFile(); pidErr != nil {
+		log.Printf("[ERROR] Could not write pidfile: %v", pidErr)
+	}
+	return inst, nil
 }
 
 func startWithListenerFds(cdyfile Input, inst *Instance, restartFds map[string]restartTriple) error {
+	// save this instance in the list now so that
+	// plugins can access it if need be, for example
+	// the caddytls package, so it can perform cert
+	// renewals while starting up; we just have to
+	// remove the instance from the list later if
+	// it fails
+	instancesMu.Lock()
+	instances = append(instances, inst)
+	instancesMu.Unlock()
+	var err error
+	defer func() {
+		if err != nil {
+			instancesMu.Lock()
+			for i, otherInst := range instances {
+				if otherInst == inst {
+					instances = append(instances[:i], instances[i+1:]...)
+					break
+				}
+			}
+			instancesMu.Unlock()
+		}
+	}()
+
 	if cdyfile == nil {
 		cdyfile = CaddyfileInput{}
+	}
+
+	err = ValidateAndExecuteDirectives(cdyfile, inst, false)
+	if err != nil {
+		return err
+	}
+
+	slist, err := inst.context.MakeServers()
+	if err != nil {
+		return err
+	}
+
+	// run startup callbacks
+	if !IsUpgrade() && restartFds == nil {
+		// first startup means not a restart or upgrade
+		for _, firstStartupFunc := range inst.onFirstStartup {
+			err = firstStartupFunc()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	for _, startupFunc := range inst.onStartup {
+		err = startupFunc()
+		if err != nil {
+			return err
+		}
+	}
+
+	err = startServers(slist, inst, restartFds)
+	if err != nil {
+		return err
+	}
+
+	// run any AfterStartup callbacks if this is not
+	// part of a restart; then show file descriptor notice
+	if restartFds == nil {
+		for _, srvln := range inst.servers {
+			if srv, ok := srvln.server.(AfterStartup); ok {
+				srv.OnStartupComplete()
+			}
+		}
+		if !Quiet {
+			for _, srvln := range inst.servers {
+				// only show FD notice if the listener is not nil.
+				// This can happen when only serving UDP or TCP
+				if srvln.listener == nil {
+					continue
+				}
+				if !IsLoopback(srvln.listener.Addr().String()) {
+					checkFdlimit()
+					break
+				}
+			}
+		}
+	}
+
+	mu.Lock()
+	started = true
+	mu.Unlock()
+
+	return nil
+}
+
+// ValidateAndExecuteDirectives will load the server blocks from cdyfile
+// by parsing it, then execute the directives configured by it and store
+// the resulting server blocks into inst. If justValidate is true, parse
+// callbacks will not be executed between directives, since the purpose
+// is only to check the input for valid syntax.
+func ValidateAndExecuteDirectives(cdyfile Input, inst *Instance, justValidate bool) error {
+	// If parsing only inst will be nil, create an instance for this function call only.
+	if justValidate {
+		inst = &Instance{serverType: cdyfile.ServerType(), wg: new(sync.WaitGroup), Storage: make(map[interface{}]interface{})}
 	}
 
 	stypeName := cdyfile.ServerType()
@@ -446,79 +605,21 @@ func startWithListenerFds(cdyfile Input, inst *Instance, restartFds map[string]r
 		return err
 	}
 
-	inst.context = stype.NewContext()
+	inst.context = stype.NewContext(inst)
 	if inst.context == nil {
 		return fmt.Errorf("server type %s produced a nil Context", stypeName)
 	}
 
 	sblocks, err = inst.context.InspectServerBlocks(cdyfile.Path(), sblocks)
 	if err != nil {
-		return err
+		return fmt.Errorf("error inspecting server blocks: %v", err)
 	}
 
-	err = executeDirectives(inst, cdyfile.Path(), stype.Directives(), sblocks)
-	if err != nil {
-		return err
-	}
-
-	slist, err := inst.context.MakeServers()
-	if err != nil {
-		return err
-	}
-
-	// run startup callbacks
-	if restartFds == nil {
-		for _, firstStartupFunc := range inst.onFirstStartup {
-			err := firstStartupFunc()
-			if err != nil {
-				return err
-			}
-		}
-	}
-	for _, startupFunc := range inst.onStartup {
-		err := startupFunc()
-		if err != nil {
-			return err
-		}
-	}
-
-	err = startServers(slist, inst, restartFds)
-	if err != nil {
-		return err
-	}
-
-	instancesMu.Lock()
-	instances = append(instances, inst)
-	instancesMu.Unlock()
-
-	// run any AfterStartup callbacks if this is not
-	// part of a restart; then show file descriptor notice
-	if restartFds == nil {
-		for _, srvln := range inst.servers {
-			if srv, ok := srvln.server.(AfterStartup); ok {
-				srv.OnStartupComplete()
-			}
-		}
-		if !Quiet {
-			for _, srvln := range inst.servers {
-				if !IsLoopback(srvln.listener.Addr().String()) {
-					checkFdlimit()
-					break
-				}
-			}
-		}
-	}
-
-	mu.Lock()
-	started = true
-	mu.Unlock()
-
-	return nil
+	return executeDirectives(inst, cdyfile.Path(), stype.Directives(), sblocks, justValidate)
 }
 
 func executeDirectives(inst *Instance, filename string,
-	directives []string, sblocks []caddyfile.ServerBlock) error {
-
+	directives []string, sblocks []caddyfile.ServerBlock, justValidate bool) error {
 	// map of server block ID to map of directive name to whatever.
 	storages := make(map[int]map[string]interface{})
 
@@ -568,12 +669,14 @@ func executeDirectives(inst *Instance, filename string,
 			}
 		}
 
-		// See if there are any callbacks to execute after this directive
-		if allCallbacks, ok := parsingCallbacks[inst.serverType]; ok {
-			callbacks := allCallbacks[dir]
-			for _, callback := range callbacks {
-				if err := callback(inst.context); err != nil {
-					return err
+		if !justValidate {
+			// See if there are any callbacks to execute after this directive
+			if allCallbacks, ok := parsingCallbacks[inst.serverType]; ok {
+				callbacks := allCallbacks[dir]
+				for _, callback := range callbacks {
+					if err := callback(inst.context); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -592,6 +695,36 @@ func startServers(serverList []Server, inst *Instance, restartFds map[string]res
 			err error
 		)
 
+		// if performing an upgrade, obtain listener file descriptors
+		// from parent process
+		if IsUpgrade() {
+			if gs, ok := s.(GracefulServer); ok {
+				addr := gs.Address()
+				if fdIndex, ok := loadedGob.ListenerFds["tcp"+addr]; ok {
+					file := os.NewFile(fdIndex, "")
+					ln, err = net.FileListener(file)
+					if err != nil {
+						return err
+					}
+					err = file.Close()
+					if err != nil {
+						return err
+					}
+				}
+				if fdIndex, ok := loadedGob.ListenerFds["udp"+addr]; ok {
+					file := os.NewFile(fdIndex, "")
+					pc, err = net.FilePacketConn(file)
+					if err != nil {
+						return err
+					}
+					err = file.Close()
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+
 		// If this is a reload and s is a GracefulServer,
 		// reuse the listener for a graceful restart.
 		if gs, ok := s.(GracefulServer); ok && restartFds != nil {
@@ -607,7 +740,10 @@ func startServers(serverList []Server, inst *Instance, restartFds map[string]res
 					if err != nil {
 						return err
 					}
-					file.Close()
+					err = file.Close()
+					if err != nil {
+						return err
+					}
 				}
 				// packetconn
 				if old.packet != nil {
@@ -619,7 +755,10 @@ func startServers(serverList []Server, inst *Instance, restartFds map[string]res
 					if err != nil {
 						return err
 					}
-					file.Close()
+					err = file.Close()
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -739,23 +878,36 @@ func IsLoopback(addr string) bool {
 		strings.HasPrefix(host, "127.")
 }
 
-// Upgrade re-launches the process, preserving the listeners
-// for a graceful restart. It does NOT load new configuration;
-// it only starts the process anew with a fresh binary.
-//
-// TODO: This is not yet implemented
-func Upgrade() error {
-	return fmt.Errorf("not implemented")
-	// TODO: have child process set isUpgrade = true
-}
+// IsInternal returns true if the IP of addr
+// belongs to a private network IP range. addr must only
+// be an IP or an IP:port combination.
+// Loopback addresses are considered false.
+func IsInternal(addr string) bool {
+	privateNetworks := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"fc00::/7",
+	}
 
-// IsUpgrade returns true if this process is part of an upgrade
-// where a parent caddy process spawned this one to ugprade
-// the binary.
-func IsUpgrade() bool {
-	mu.Lock()
-	defer mu.Unlock()
-	return isUpgrade
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr // happens if the addr is just a hostname, missing port
+		// if we encounter an error, the brackets need to be stripped
+		// because SplitHostPort didn't do it for us
+		host = strings.Trim(host, "[]")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, privateNetwork := range privateNetworks {
+		_, ipnet, _ := net.ParseCIDR(privateNetwork)
+		if ipnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // Started returns true if at least one instance has been
@@ -845,3 +997,6 @@ var (
 	// by default if no other file is specified.
 	DefaultConfigFile = "Caddyfile"
 )
+
+// CtxKey is a value type for use with context.WithValue.
+type CtxKey string

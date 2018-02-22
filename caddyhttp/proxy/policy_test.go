@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package proxy
 
 import (
@@ -60,13 +74,13 @@ func TestRoundRobinPolicy(t *testing.T) {
 		t.Error("Expected third round robin host to be first host in the pool.")
 	}
 	// mark host as down
-	pool[1].Unhealthy = true
+	pool[1].Unhealthy = 1
 	h = rrPolicy.Select(pool, request)
 	if h != pool[2] {
 		t.Error("Expected to skip down host.")
 	}
 	// mark host as up
-	pool[1].Unhealthy = false
+	pool[1].Unhealthy = 0
 
 	h = rrPolicy.Select(pool, request)
 	if h == pool[2] {
@@ -161,7 +175,7 @@ func TestIPHashPolicy(t *testing.T) {
 	// we should get a healthy host if the original host is unhealthy and a
 	// healthy host is available
 	request.RemoteAddr = "172.0.0.1"
-	pool[1].Unhealthy = true
+	pool[1].Unhealthy = 1
 	h = ipHash.Select(pool, request)
 	if h != pool[2] {
 		t.Error("Expected ip hash policy host to be the third host.")
@@ -172,10 +186,10 @@ func TestIPHashPolicy(t *testing.T) {
 	if h != pool[2] {
 		t.Error("Expected ip hash policy host to be the third host.")
 	}
-	pool[1].Unhealthy = false
+	pool[1].Unhealthy = 0
 
 	request.RemoteAddr = "172.0.0.3"
-	pool[2].Unhealthy = true
+	pool[2].Unhealthy = 1
 	h = ipHash.Select(pool, request)
 	if h != pool[0] {
 		t.Error("Expected ip hash policy host to be the first host.")
@@ -219,10 +233,125 @@ func TestIPHashPolicy(t *testing.T) {
 	}
 
 	// We should get nil when there are no healthy hosts
-	pool[0].Unhealthy = true
-	pool[1].Unhealthy = true
+	pool[0].Unhealthy = 1
+	pool[1].Unhealthy = 1
 	h = ipHash.Select(pool, request)
 	if h != nil {
 		t.Error("Expected ip hash policy host to be nil.")
+	}
+}
+
+func TestFirstPolicy(t *testing.T) {
+	pool := testPool()
+	firstPolicy := &First{}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	h := firstPolicy.Select(pool, req)
+	if h != pool[0] {
+		t.Error("Expected first policy host to be the first host.")
+	}
+
+	pool[0].Unhealthy = 1
+	h = firstPolicy.Select(pool, req)
+	if h != pool[1] {
+		t.Error("Expected first policy host to be the second host.")
+	}
+}
+
+func TestUriPolicy(t *testing.T) {
+	pool := testPool()
+	uriPolicy := &URIHash{}
+
+	request := httptest.NewRequest(http.MethodGet, "/test", nil)
+	h := uriPolicy.Select(pool, request)
+	if h != pool[0] {
+		t.Error("Expected uri policy host to be the first host.")
+	}
+
+	pool[0].Unhealthy = 1
+	h = uriPolicy.Select(pool, request)
+	if h != pool[1] {
+		t.Error("Expected uri policy host to be the first host.")
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/test_2", nil)
+	h = uriPolicy.Select(pool, request)
+	if h != pool[1] {
+		t.Error("Expected uri policy host to be the second host.")
+	}
+
+	// We should be able to resize the host pool and still be able to predict
+	// where a request will be routed with the same URI's used above
+	pool = []*UpstreamHost{
+		{
+			Name: workableServer.URL, // this should resolve (healthcheck test)
+		},
+		{
+			Name: "http://localhost:99998", // this shouldn't
+		},
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/test", nil)
+	h = uriPolicy.Select(pool, request)
+	if h != pool[0] {
+		t.Error("Expected uri policy host to be the first host.")
+	}
+
+	pool[0].Unhealthy = 1
+	h = uriPolicy.Select(pool, request)
+	if h != pool[1] {
+		t.Error("Expected uri policy host to be the first host.")
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/test_2", nil)
+	h = uriPolicy.Select(pool, request)
+	if h != pool[1] {
+		t.Error("Expected uri policy host to be the second host.")
+	}
+
+	pool[0].Unhealthy = 1
+	pool[1].Unhealthy = 1
+	h = uriPolicy.Select(pool, request)
+	if h != nil {
+		t.Error("Expected uri policy policy host to be nil.")
+	}
+}
+
+func TestHeaderPolicy(t *testing.T) {
+	pool := testPool()
+	tests := []struct {
+		Policy             *Header
+		RequestHeaderName  string
+		RequestHeaderValue string
+		NilHost            bool
+		HostIndex          int
+	}{
+		{&Header{""}, "", "", true, 0},
+		{&Header{""}, "Affinity", "somevalue", true, 0},
+		{&Header{""}, "Affinity", "", true, 0},
+
+		{&Header{"Affinity"}, "", "", true, 0},
+		{&Header{"Affinity"}, "Affinity", "somevalue", false, 1},
+		{&Header{"Affinity"}, "Affinity", "somevalue2", false, 0},
+		{&Header{"Affinity"}, "Affinity", "somevalue3", false, 2},
+		{&Header{"Affinity"}, "Affinity", "", true, 0},
+	}
+
+	for idx, test := range tests {
+		request, _ := http.NewRequest("GET", "/", nil)
+		if test.RequestHeaderName != "" {
+			request.Header.Add(test.RequestHeaderName, test.RequestHeaderValue)
+		}
+
+		host := test.Policy.Select(pool, request)
+		if test.NilHost && host != nil {
+			t.Errorf("%d: Expected host to be nil", idx)
+		}
+		if !test.NilHost && host == nil {
+			t.Errorf("%d: Did not expect host to be nil", idx)
+		}
+		if !test.NilHost && host != pool[test.HostIndex] {
+			t.Errorf("%d: Expected Header policy to be host %d", idx, test.HostIndex)
+		}
 	}
 }

@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package caddytls
 
 import (
@@ -7,7 +21,6 @@ import (
 	"crypto/rand"
 	"io"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -166,12 +179,12 @@ func TestGetEmail(t *testing.T) {
 			t.Fatalf("Error saving user %d: %v", i, err)
 		}
 
-		// Change modified time so they're all different, so the test becomes deterministic
+		// Change modified time so they're all different and the test becomes more deterministic
 		f, err := os.Stat(testStorage.user(eml))
 		if err != nil {
 			t.Fatalf("Could not access user folder for '%s': %v", eml, err)
 		}
-		chTime := f.ModTime().Add(-(time.Duration(i) * time.Second))
+		chTime := f.ModTime().Add(-(time.Duration(i) * time.Hour)) // 1 second isn't always enough space!
 		if err := os.Chtimes(testStorage.user(eml), chTime, chTime); err != nil {
 			t.Fatalf("Could not change user folder mod time for '%s': %v", eml, err)
 		}
@@ -182,7 +195,7 @@ func TestGetEmail(t *testing.T) {
 	}
 }
 
-var testStorage = &FileStorage{Path: "./testdata", nameLocks: make(map[string]*sync.WaitGroup)}
+var testStorage = &FileStorage{Path: "./testdata"}
 
 func (s *FileStorage) clean() error {
 	return os.RemoveAll(s.Path)
