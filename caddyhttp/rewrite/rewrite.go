@@ -25,7 +25,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/mholt/caddy/caddyhttp/httpserver"
+	"github.com/caddyserver/caddy/caddyhttp/httpserver"
 )
 
 // Result is the result of a rewrite
@@ -63,25 +63,47 @@ type Rule interface {
 
 // SimpleRule is a simple rewrite rule.
 type SimpleRule struct {
-	From, To string
+	Regexp *regexp.Regexp
+	To     string
+	Negate bool
 }
 
 // NewSimpleRule creates a new Simple Rule
-func NewSimpleRule(from, to string) SimpleRule {
-	return SimpleRule{from, to}
+func NewSimpleRule(from, to string, negate bool) (*SimpleRule, error) {
+	r, err := regexp.Compile(from)
+	if err != nil {
+		return nil, err
+	}
+	return &SimpleRule{
+		Regexp: r,
+		To:     to,
+		Negate: negate,
+	}, nil
 }
 
 // BasePath satisfies httpserver.Config
-func (s SimpleRule) BasePath() string { return s.From }
+func (s SimpleRule) BasePath() string { return "/" }
 
 // Match satisfies httpserver.Config
-func (s SimpleRule) Match(r *http.Request) bool { return s.From == r.URL.Path }
+func (s *SimpleRule) Match(r *http.Request) bool {
+	matches := regexpMatches(s.Regexp, "/", r.URL.Path)
+	if s.Negate {
+		return len(matches) == 0
+	}
+	return len(matches) > 0
+}
 
 // Rewrite rewrites the internal location of the current request.
-func (s SimpleRule) Rewrite(fs http.FileSystem, r *http.Request) Result {
+func (s *SimpleRule) Rewrite(fs http.FileSystem, r *http.Request) Result {
+	matches := regexpMatches(s.Regexp, "/", r.URL.Path)
+
+	replacer := newReplacer(r)
+	for i := 1; i < len(matches); i++ {
+		replacer.Set(fmt.Sprint(i), matches[i])
+	}
 
 	// attempt rewrite
-	return To(fs, r, s.To, newReplacer(r))
+	return To(fs, r, s.To, replacer)
 }
 
 // ComplexRule is a rewrite rule based on a regular expression
@@ -165,7 +187,7 @@ func (r ComplexRule) Match(req *http.Request) bool {
 		return true
 	}
 	// otherwise validate regex
-	return r.regexpMatches(req.URL.Path) != nil
+	return regexpMatches(r.Regexp, r.Base, req.URL.Path) != nil
 }
 
 // Rewrite rewrites the internal location of the current request.
@@ -174,7 +196,7 @@ func (r ComplexRule) Rewrite(fs http.FileSystem, req *http.Request) (re Result) 
 
 	// validate regexp if present
 	if r.Regexp != nil {
-		matches := r.regexpMatches(req.URL.Path)
+		matches := regexpMatches(r.Regexp, r.Base, req.URL.Path)
 		switch len(matches) {
 		case 0:
 			// no match
@@ -182,16 +204,7 @@ func (r ComplexRule) Rewrite(fs http.FileSystem, req *http.Request) (re Result) 
 		default:
 			// set regexp match variables {1}, {2} ...
 
-			// url escaped values of ? and #.
-			q, f := url.QueryEscape("?"), url.QueryEscape("#")
-
 			for i := 1; i < len(matches); i++ {
-				// Special case of unescaped # and ? by stdlib regexp.
-				// Reverse the unescape.
-				if strings.ContainsAny(matches[i], "?#") {
-					matches[i] = strings.NewReplacer("?", q, "#", f).Replace(matches[i])
-				}
-
 				replacer.Set(fmt.Sprint(i), matches[i])
 			}
 		}
@@ -230,14 +243,28 @@ func (r ComplexRule) matchExt(rPath string) bool {
 	return !mustUse
 }
 
-func (r ComplexRule) regexpMatches(rPath string) []string {
-	if r.Regexp != nil {
+var escaper = strings.NewReplacer("?", url.QueryEscape("?"), "#", url.QueryEscape("#"))
+
+func regexpMatches(regexp *regexp.Regexp, base, rPath string) []string {
+	if regexp != nil {
 		// include trailing slash in regexp if present
-		start := len(r.Base)
-		if strings.HasSuffix(r.Base, "/") {
+		start := len(base)
+		if strings.HasSuffix(base, "/") {
 			start--
 		}
-		return r.Regexp.FindStringSubmatch(rPath[start:])
+
+		matches := regexp.FindStringSubmatch(rPath[start:])
+
+		// When processing a rewrite rule, the matching is done with an unescaped
+		// version of the old path. However, when such a match contains a ? or #
+		// character, the match cannot be used verbatim in the "to" URL because
+		// there it would be interpreted as query/fragment marker, so we re-escape
+		// those characters:
+		for i := 1; i < len(matches); i++ {
+			matches[i] = escaper.Replace(matches[i])
+		}
+
+		return matches
 	}
 	return nil
 }

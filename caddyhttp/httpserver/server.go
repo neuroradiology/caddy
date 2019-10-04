@@ -29,21 +29,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/caddyserver/caddy"
+	"github.com/caddyserver/caddy/caddyhttp/staticfiles"
+	"github.com/caddyserver/caddy/caddytls"
+	"github.com/caddyserver/caddy/telemetry"
 	"github.com/lucas-clemente/quic-go/h2quic"
-	"github.com/mholt/caddy"
-	"github.com/mholt/caddy/caddyhttp/staticfiles"
-	"github.com/mholt/caddy/caddytls"
 )
 
 // Server is the HTTP server implementation.
 type Server struct {
 	Server      *http.Server
 	quicServer  *h2quic.Server
-	listener    net.Listener
-	listenerMu  sync.Mutex
 	sites       []*SiteConfig
 	connTimeout time.Duration // max time to wait for a connection before force stop
 	tlsGovChan  chan struct{} // close to stop the TLS maintenance goroutine
@@ -236,7 +234,9 @@ func makeHTTPServerWithTimeouts(addr string, group []*SiteConfig) *http.Server {
 
 func (s *Server) wrapWithSvcHeaders(previousHandler http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		s.quicServer.SetQuicHeaders(w.Header())
+		if err := s.quicServer.SetQuicHeaders(w.Header()); err != nil {
+			log.Println("[Error] failed to set proper headers for QUIC: ", err)
+		}
 		previousHandler.ServeHTTP(w, r)
 	}
 }
@@ -245,7 +245,7 @@ func (s *Server) wrapWithSvcHeaders(previousHandler http.Handler) http.HandlerFu
 // used to serve requests.
 func (s *Server) Listen() (net.Listener, error) {
 	if s.Server == nil {
-		return nil, fmt.Errorf("Server field is nil")
+		return nil, fmt.Errorf("server field is nil")
 	}
 
 	ln, err := net.Listen("tcp", s.Server.Addr)
@@ -273,16 +273,26 @@ func (s *Server) Listen() (net.Listener, error) {
 		ln = tcpKeepAliveListener{TCPListener: tcpLn}
 	}
 
+	cln := s.WrapListener(ln)
+
+	// Very important to return a concrete caddy.Listener
+	// implementation for graceful restarts.
+	return cln.(caddy.Listener), nil
+}
+
+// WrapListener wraps ln in the listener middlewares configured
+// for this server.
+func (s *Server) WrapListener(ln net.Listener) net.Listener {
+	if ln == nil {
+		return nil
+	}
 	cln := ln.(caddy.Listener)
 	for _, site := range s.sites {
 		for _, m := range site.listenerMiddleware {
 			cln = m(cln)
 		}
 	}
-
-	// Very important to return a concrete caddy.Listener
-	// implementation for graceful restarts.
-	return cln.(caddy.Listener), nil
+	return cln
 }
 
 // ListenPacket creates udp connection for QUIC if it is enabled,
@@ -299,10 +309,6 @@ func (s *Server) ListenPacket() (net.PacketConn, error) {
 
 // Serve serves requests on ln. It blocks until ln is closed.
 func (s *Server) Serve(ln net.Listener) error {
-	s.listenerMu.Lock()
-	s.listener = ln
-	s.listenerMu.Unlock()
-
 	if s.Server.TLSConfig != nil {
 		// Create TLS listener - note that we do not replace s.listener
 		// with this TLS listener; tls.listener is unexported and does
@@ -318,11 +324,19 @@ func (s *Server) Serve(ln net.Listener) error {
 		s.tlsGovChan = caddytls.RotateSessionTicketKeys(s.Server.TLSConfig)
 	}
 
+	defer func() {
+		if s.quicServer != nil {
+			if err := s.quicServer.Close(); err != nil {
+				log.Println("[ERROR] failed to close QUIC server: ", err)
+			}
+		}
+	}()
+
 	err := s.Server.Serve(ln)
-	if s.quicServer != nil {
-		s.quicServer.Close()
+	if err != nil && err != http.ErrServerClosed {
+		return err
 	}
-	return err
+	return nil
 }
 
 // ServePacket serves QUIC requests on pc until it is closed.
@@ -344,6 +358,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			DefaultErrorFunc(w, r, http.StatusInternalServerError)
 		}
 	}()
+
+	// record the User-Agent string (with a cap on its length to mitigate attacks)
+	ua := r.Header.Get("User-Agent")
+	if len(ua) > 512 {
+		ua = ua[:512]
+	}
+	uaHash := telemetry.FastHash([]byte(ua)) // this is a normalized field
+	go telemetry.SetNested("http_user_agent", uaHash, ua)
+	go telemetry.AppendUnique("http_user_agent_count", uaHash)
+	go telemetry.Increment("http_request_count")
 
 	// copy the original, unchanged URL into the context
 	// so it can be referenced by middlewares
@@ -388,24 +412,26 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 
 	if vhost == nil {
 		// check for ACME challenge even if vhost is nil;
-		// could be a new host coming online soon
-		if caddytls.HTTPChallengeHandler(w, r, "localhost") {
+		// could be a new host coming online soon - choose any
+		// vhost's cert manager configuration, I guess
+		if len(s.sites) > 0 && s.sites[0].TLS.Manager.HandleHTTPChallenge(w, r) {
 			return 0, nil
 		}
+
 		// otherwise, log the error and write a message to the client
 		remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			remoteHost = r.RemoteAddr
 		}
-		WriteSiteNotFound(w, r) // don't add headers outside of this function
+		WriteSiteNotFound(w, r) // don't add headers outside of this function (http.forwardproxy)
 		log.Printf("[INFO] %s - No such site at %s (Remote: %s, Referer: %s)",
 			hostname, s.Server.Addr, remoteHost, r.Header.Get("Referer"))
 		return 0, nil
 	}
 
 	// we still check for ACME challenge if the vhost exists,
-	// because we must apply its HTTP challenge config settings
-	if caddytls.HTTPChallengeHandler(w, r, vhost.ListenHost) {
+	// because the HTTP challenge might be disabled by its config
+	if vhost.TLS.Manager.HandleHTTPChallenge(w, r) {
 		return 0, nil
 	}
 
@@ -416,19 +442,39 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) (int, error) 
 		r.URL = trimPathPrefix(r.URL, pathPrefix)
 	}
 
+	// enforce strict host matching, which ensures that the SNI
+	// value (if any), matches the Host header; essential for
+	// sites that rely on TLS ClientAuth sharing a port with
+	// sites that do not - if mismatched, close the connection
+	if vhost.StrictHostMatching && r.TLS != nil &&
+		strings.ToLower(r.TLS.ServerName) != strings.ToLower(hostname) {
+		r.Close = true
+		log.Printf("[ERROR] %s - strict host matching: SNI (%s) and HTTP Host (%s) values differ",
+			vhost.Addr, r.TLS.ServerName, hostname)
+		return http.StatusForbidden, nil
+	}
+
 	return vhost.middlewareChain.ServeHTTP(w, r)
 }
 
 func trimPathPrefix(u *url.URL, prefix string) *url.URL {
 	// We need to use URL.EscapedPath() when trimming the pathPrefix as
 	// URL.Path is ambiguous about / or %2f - see docs. See #1927
-	trimmed := strings.TrimPrefix(u.EscapedPath(), prefix)
-	if !strings.HasPrefix(trimmed, "/") {
-		trimmed = "/" + trimmed
+	trimmedPath := strings.TrimPrefix(u.EscapedPath(), prefix)
+	if !strings.HasPrefix(trimmedPath, "/") {
+		trimmedPath = "/" + trimmedPath
 	}
-	trimmedURL, err := url.Parse(trimmed)
+	// After trimming path reconstruct uri string with Query before parsing
+	trimmedURI := trimmedPath
+	if u.RawQuery != "" || u.ForceQuery == true {
+		trimmedURI = trimmedPath + "?" + u.RawQuery
+	}
+	if u.Fragment != "" {
+		trimmedURI = trimmedURI + "#" + u.Fragment
+	}
+	trimmedURL, err := url.Parse(trimmedURI)
 	if err != nil {
-		log.Printf("[ERROR] Unable to parse trimmed URL %s: %v", trimmed, err)
+		log.Printf("[ERROR] Unable to parse trimmed URL %s: %v", trimmedURI, err)
 		return u
 	}
 	return trimmedURL
@@ -461,16 +507,34 @@ func (s *Server) Stop() error {
 // OnStartupComplete lists the sites served by this server
 // and any relevant information, assuming caddy.Quiet == false.
 func (s *Server) OnStartupComplete() {
-	if caddy.Quiet {
-		return
+	if !caddy.Quiet {
+		firstSite := s.sites[0]
+		scheme := "HTTP"
+		if firstSite.TLS.Enabled {
+			scheme = "HTTPS"
+		}
+
+		fmt.Println("")
+		fmt.Printf("Serving %s on port "+firstSite.Port()+" \n", scheme)
+		s.outputSiteInfo(false)
+		fmt.Println("")
 	}
+
+	// Print out process log without header comment
+	s.outputSiteInfo(true)
+}
+
+func (s *Server) outputSiteInfo(isProcessLog bool) {
 	for _, site := range s.sites {
 		output := site.Addr.String()
 		if caddy.IsLoopback(s.Address()) && !caddy.IsLoopback(site.Addr.Host) {
 			output += " (only accessible on this machine)"
 		}
-		fmt.Println(output)
-		log.Println(output)
+		if isProcessLog {
+			log.Printf("[INFO] Serving %s \n", output)
+		} else {
+			fmt.Println(output)
+		}
 	}
 }
 
@@ -495,8 +559,12 @@ func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
 	if err != nil {
 		return
 	}
-	tc.SetKeepAlive(true)
-	tc.SetKeepAlivePeriod(3 * time.Minute)
+	if err = tc.SetKeepAlive(true); err != nil {
+		return
+	}
+	if err = tc.SetKeepAlivePeriod(3 * time.Minute); err != nil {
+		return
+	}
 	return tc, nil
 }
 
@@ -534,7 +602,9 @@ func WriteTextResponse(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
-	w.Write([]byte(body))
+	if _, err := w.Write([]byte(body)); err != nil {
+		log.Println("[Error] failed to write body: ", err)
+	}
 }
 
 // SafePath joins siteRoot and reqPath and converts it to a path that can

@@ -20,8 +20,8 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/mholt/caddy"
-	"github.com/mholt/caddy/caddyhttp/httpserver"
+	"github.com/caddyserver/caddy"
+	"github.com/caddyserver/caddy/caddyhttp/httpserver"
 )
 
 func init() {
@@ -67,6 +67,10 @@ func (l Logger) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 
 			// Write log entries
 			for _, e := range rule.Entries {
+				// Check if there is an exception to prevent log being written
+				if !e.Log.ShouldLog(r.URL.Path) {
+					continue
+				}
 
 				// Mask IP Address
 				if e.Log.IPMaskExists {
@@ -78,6 +82,7 @@ func (l Logger) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 					}
 				}
 				e.Log.Println(rep.Replace(e.Format))
+
 			}
 
 			return status, err

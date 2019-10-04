@@ -15,6 +15,7 @@
 package httpserver
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -22,20 +23,23 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/mholt/caddy"
-	"github.com/mholt/caddy/caddyfile"
-	"github.com/mholt/caddy/caddyhttp/staticfiles"
-	"github.com/mholt/caddy/caddytls"
+	"github.com/caddyserver/caddy"
+	"github.com/caddyserver/caddy/caddyfile"
+	"github.com/caddyserver/caddy/caddyhttp/staticfiles"
+	"github.com/caddyserver/caddy/caddytls"
+	"github.com/caddyserver/caddy/telemetry"
+	"github.com/mholt/certmagic"
 )
 
 const serverType = "http"
 
 func init() {
-	flag.StringVar(&HTTPPort, "http-port", HTTPPort, "Default port to use for HTTP")
-	flag.StringVar(&HTTPSPort, "https-port", HTTPSPort, "Default port to use for HTTPS")
+	flag.IntVar(&certmagic.HTTPPort, "http-port", certmagic.HTTPPort, "Default port to use for HTTP")
+	flag.IntVar(&certmagic.HTTPSPort, "https-port", certmagic.HTTPSPort, "Default port to use for HTTPS")
 	flag.StringVar(&Host, "host", DefaultHost, "Default host")
 	flag.StringVar(&Port, "port", DefaultPort, "Default port")
 	flag.StringVar(&Root, "root", DefaultRoot, "Root path of default site")
@@ -65,6 +69,12 @@ func init() {
 	caddy.RegisterParsingCallback(serverType, "root", hideCaddyfile)
 	caddy.RegisterParsingCallback(serverType, "tls", activateHTTPS)
 	caddytls.RegisterConfigGetter(serverType, func(c *caddy.Controller) *caddytls.Config { return GetConfig(c).TLS })
+
+	// disable the caddytls package reporting ClientHellos
+	// to telemetry, since our MITM detector does this but
+	// with more information than the standard lib provides
+	// (as of May 2018)
+	caddytls.ClientHelloTelemetry = false
 }
 
 // hideCaddyfile hides the source/origin Caddyfile if it is within the
@@ -118,17 +128,21 @@ func (h *httpContext) saveConfig(key string, cfg *SiteConfig) {
 // be parsed and executed.
 func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []caddyfile.ServerBlock) ([]caddyfile.ServerBlock, error) {
 	siteAddrs := make(map[string]string)
+	httpPort := strconv.Itoa(certmagic.HTTPPort)
+	httpsPort := strconv.Itoa(certmagic.HTTPSPort)
 
 	// For each address in each server block, make a new config
 	for _, sb := range serverBlocks {
 		for _, key := range sb.Keys {
-			key = strings.ToLower(key)
-			if _, dup := h.keysToSiteConfigs[key]; dup {
-				return serverBlocks, fmt.Errorf("duplicate site key: %s", key)
-			}
 			addr, err := standardizeAddress(key)
 			if err != nil {
 				return serverBlocks, err
+			}
+
+			addr = addr.Normalize()
+			key = addr.Key()
+			if _, dup := h.keysToSiteConfigs[key]; dup {
+				return serverBlocks, fmt.Errorf("duplicate site key: %s", key)
 			}
 
 			// Fill in address components from command line so that middleware
@@ -145,7 +159,7 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 			if addrCopy.Port == "" && Port == DefaultPort {
 				addrCopy.Port = Port
 			}
-			addrStr := strings.ToLower(addrCopy.String())
+			addrStr := addrCopy.String()
 			if otherSiteKey, dup := siteAddrs[addrStr]; dup {
 				err := fmt.Errorf("duplicate site address: %s", addrStr)
 				if (addrCopy.Host == Host && Host != DefaultHost) ||
@@ -159,21 +173,32 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 
 			// If default HTTP or HTTPS ports have been customized,
 			// make sure the ACME challenge ports match
-			var altHTTPPort, altTLSSNIPort string
-			if HTTPPort != DefaultHTTPPort {
-				altHTTPPort = HTTPPort
+			var altHTTPPort, altTLSALPNPort int
+			if httpPort != DefaultHTTPPort {
+				portInt, err := strconv.Atoi(httpPort)
+				if err != nil {
+					return nil, err
+				}
+				altHTTPPort = portInt
 			}
-			if HTTPSPort != DefaultHTTPSPort {
-				altTLSSNIPort = HTTPSPort
+			if httpsPort != DefaultHTTPSPort {
+				portInt, err := strconv.Atoi(httpsPort)
+				if err != nil {
+					return nil, err
+				}
+				altTLSALPNPort = portInt
 			}
 
 			// Make our caddytls.Config, which has a pointer to the
 			// instance's certificate cache and enough information
 			// to use automatic HTTPS when the time comes
-			caddytlsConfig := caddytls.NewConfig(h.instance)
+			caddytlsConfig, err := caddytls.NewConfig(h.instance)
+			if err != nil {
+				return nil, fmt.Errorf("creating new caddytls configuration: %v", err)
+			}
 			caddytlsConfig.Hostname = addr.Host
-			caddytlsConfig.AltHTTPPort = altHTTPPort
-			caddytlsConfig.AltTLSSNIPort = altTLSSNIPort
+			caddytlsConfig.Manager.AltHTTPPort = altHTTPPort
+			caddytlsConfig.Manager.AltTLSALPNPort = altTLSALPNPort
 
 			// Save the config to our master list, and key it for lookups
 			cfg := &SiteConfig{
@@ -205,13 +230,48 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 // MakeServers uses the newly-created siteConfigs to
 // create and return a list of server instances.
 func (h *httpContext) MakeServers() ([]caddy.Server, error) {
-	// make sure TLS is disabled for explicitly-HTTP sites
-	// (necessary when HTTP address shares a block containing tls)
+	httpPort := strconv.Itoa(certmagic.HTTPPort)
+	httpsPort := strconv.Itoa(certmagic.HTTPSPort)
+
+	// make a rough estimate as to whether we're in a "production
+	// environment/system" - start by assuming that most production
+	// servers will set their default CA endpoint to a public,
+	// trusted CA (obviously not a perfect heuristic)
+	var looksLikeProductionCA bool
+	for _, publicCAEndpoint := range caddytls.KnownACMECAs {
+		if strings.Contains(certmagic.Default.CA, publicCAEndpoint) {
+			looksLikeProductionCA = true
+			break
+		}
+	}
+
+	// Iterate each site configuration and make sure that:
+	// 1) TLS is disabled for explicitly-HTTP sites (necessary
+	//    when an HTTP address shares a block containing tls)
+	// 2) if QUIC is enabled, TLS ClientAuth is not, because
+	//    currently, QUIC does not support ClientAuth (TODO:
+	//    revisit this when our QUIC implementation supports it)
+	// 3) if TLS ClientAuth is used, StrictHostMatching is on
+	var atLeastOneSiteLooksLikeProduction bool
 	for _, cfg := range h.siteConfigs {
+		// see if all the addresses (both sites and
+		// listeners) are loopback to help us determine
+		// if this is a "production" instance or not
+		if !atLeastOneSiteLooksLikeProduction {
+			if !caddy.IsLoopback(cfg.Addr.Host) &&
+				!caddy.IsLoopback(cfg.ListenHost) &&
+				(caddytls.QualifiesForManagedTLS(cfg) ||
+					certmagic.HostQualifies(cfg.Addr.Host)) {
+				atLeastOneSiteLooksLikeProduction = true
+			}
+		}
+
+		// make sure TLS is disabled for explicitly-HTTP sites
+		// (necessary when HTTP address shares a block containing tls)
 		if !cfg.TLS.Enabled {
 			continue
 		}
-		if cfg.Addr.Port == HTTPPort || cfg.Addr.Scheme == "http" {
+		if cfg.Addr.Port == httpPort || cfg.Addr.Scheme == "http" {
 			cfg.TLS.Enabled = false
 			log.Printf("[WARNING] TLS disabled for %s", cfg.Addr)
 		} else if cfg.Addr.Scheme == "" {
@@ -222,11 +282,22 @@ func (h *httpContext) MakeServers() ([]caddy.Server, error) {
 			// is incorrect for this site.
 			cfg.Addr.Scheme = "https"
 		}
-		if cfg.Addr.Port == "" && ((!cfg.TLS.Manual && !cfg.TLS.SelfSigned) || cfg.TLS.OnDemand) {
+		if cfg.Addr.Port == "" && ((!cfg.TLS.Manual && !cfg.TLS.SelfSigned) || cfg.TLS.Manager.OnDemand != nil) {
 			// this is vital, otherwise the function call below that
 			// sets the listener address will use the default port
 			// instead of 443 because it doesn't know about TLS.
-			cfg.Addr.Port = HTTPSPort
+			cfg.Addr.Port = httpsPort
+		}
+		if cfg.TLS.ClientAuth != tls.NoClientCert {
+			if QUIC {
+				return nil, fmt.Errorf("cannot enable TLS client authentication with QUIC, because QUIC does not yet support it")
+			}
+			// this must be enabled so that a client cannot connect
+			// using SNI for another site on this listener that
+			// does NOT require ClientAuth, and then send HTTP
+			// requests with the Host header of this site which DOES
+			// require client auth, thus bypassing it...
+			cfg.StrictHostMatching = true
 		}
 	}
 
@@ -246,7 +317,29 @@ func (h *httpContext) MakeServers() ([]caddy.Server, error) {
 		servers = append(servers, s)
 	}
 
+	// NOTE: This value is only a "good guess". Quite often, development
+	// environments will use internal DNS or a local hosts file to serve
+	// real-looking domains in local development. We can't easily tell
+	// which without doing a DNS lookup, so this guess is definitely naive,
+	// and if we ever want a better guess, we will have to do DNS lookups.
+	deploymentGuess := "dev"
+	if looksLikeProductionCA && atLeastOneSiteLooksLikeProduction {
+		deploymentGuess = "prod"
+	}
+	telemetry.Set("http_deployment_guess", deploymentGuess)
+	telemetry.Set("http_num_sites", len(h.siteConfigs))
+
 	return servers, nil
+}
+
+// normalizedKey returns "normalized" key representation:
+//  scheme and host names are lowered, everything else stays the same
+func normalizedKey(key string) string {
+	addr, err := standardizeAddress(key)
+	if err != nil {
+		return key
+	}
+	return addr.Normalize().Key()
 }
 
 // GetConfig gets the SiteConfig that corresponds to c.
@@ -254,14 +347,18 @@ func (h *httpContext) MakeServers() ([]caddy.Server, error) {
 // new, empty one will be created.
 func GetConfig(c *caddy.Controller) *SiteConfig {
 	ctx := c.Context().(*httpContext)
-	key := strings.ToLower(c.Key)
+	key := normalizedKey(c.Key)
 	if cfg, ok := ctx.keysToSiteConfigs[key]; ok {
 		return cfg
 	}
 	// we should only get here during tests because directive
 	// actions typically skip the server blocks where we make
 	// the configs
-	cfg := &SiteConfig{Root: Root, TLS: new(caddytls.Config), IndexPages: staticfiles.DefaultIndexPages}
+	cfg := &SiteConfig{
+		Root:       Root,
+		TLS:        &caddytls.Config{Manager: certmagic.NewDefault()},
+		IndexPages: staticfiles.DefaultIndexPages,
+	}
 	ctx.saveConfig(key, cfg)
 	return cfg
 }
@@ -316,6 +413,8 @@ func groupSiteConfigsByListenAddr(configs []*SiteConfig) (map[string][]*SiteConf
 // parts of an address. The component parts may be
 // updated to the correct values as setup proceeds,
 // but the original value should never be changed.
+//
+// The Host field must be in a normalized form.
 type Address struct {
 	Original, Scheme, Host, Port, Path string
 }
@@ -327,7 +426,7 @@ func (a Address) String() string {
 	}
 	scheme := a.Scheme
 	if scheme == "" {
-		if a.Port == HTTPSPort {
+		if a.Port == strconv.Itoa(certmagic.HTTPSPort) {
 			scheme = "https"
 		} else {
 			scheme = "http"
@@ -337,11 +436,12 @@ func (a Address) String() string {
 	if s != "" {
 		s += "://"
 	}
-	s += a.Host
 	if a.Port != "" &&
 		((scheme == "https" && a.Port != DefaultHTTPSPort) ||
 			(scheme == "http" && a.Port != DefaultHTTPPort)) {
-		s += ":" + a.Port
+		s += net.JoinHostPort(a.Host, a.Port)
+	} else {
+		s += a.Host
 	}
 	if a.Path != "" {
 		s += a.Path
@@ -358,10 +458,65 @@ func (a Address) VHost() string {
 	return a.Original
 }
 
+// Normalize normalizes URL: turn scheme and host names into lower case
+func (a Address) Normalize() Address {
+	path := a.Path
+	if !CaseSensitivePath {
+		path = strings.ToLower(path)
+	}
+
+	// ensure host is normalized if it's an IP address
+	host := a.Host
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+
+	return Address{
+		Original: a.Original,
+		Scheme:   strings.ToLower(a.Scheme),
+		Host:     strings.ToLower(host),
+		Port:     a.Port,
+		Path:     path,
+	}
+}
+
+// Key is similar to String, just replaces scheme and host values with modified values.
+// Unlike String it doesn't add anything default (scheme, port, etc)
+func (a Address) Key() string {
+	res := ""
+	if a.Scheme != "" {
+		res += a.Scheme + "://"
+	}
+	if a.Host != "" {
+		res += a.Host
+	}
+	// insert port only if the original has its own explicit port
+	if a.Port != "" && len(a.Original) >= len(res) &&
+		strings.HasPrefix(a.Original[len(res):], ":"+a.Port) {
+		res += ":" + a.Port
+	}
+	if a.Path != "" {
+		res += a.Path
+	}
+	return res
+}
+
 // standardizeAddress parses an address string into a structured format with separate
 // scheme, host, port, and path portions, as well as the original input string.
 func standardizeAddress(str string) (Address, error) {
 	input := str
+
+	httpPort := strconv.Itoa(certmagic.HTTPPort)
+	httpsPort := strconv.Itoa(certmagic.HTTPSPort)
+
+	// As of Go 1.12.8 (Aug 2019), ports that are service names such
+	// as ":http" and ":https" are no longer parsed as they were
+	// before, which is a breaking change for us. Attempt to smooth
+	// this over for now by replacing those strings with their port
+	// equivalents. See
+	// https://github.com/golang/go/commit/3226f2d492963d361af9dfc6714ef141ba606713
+	str = strings.Replace(str, ":https", ":"+httpsPort, 1)
+	str = strings.Replace(str, ":http", ":"+httpPort, 1)
 
 	// Split input into components (prepend with // to assert host by default)
 	if !strings.Contains(str, "//") && !strings.HasPrefix(str, "/") {
@@ -384,32 +539,28 @@ func standardizeAddress(str string) (Address, error) {
 	// see if we can set port based off scheme
 	if port == "" {
 		if u.Scheme == "http" {
-			port = HTTPPort
+			port = httpPort
 		} else if u.Scheme == "https" {
-			port = HTTPSPort
+			port = httpsPort
 		}
 	}
 
-	// repeated or conflicting scheme is confusing, so error
-	if u.Scheme != "" && (port == "http" || port == "https") {
-		return Address{}, fmt.Errorf("[%s] scheme specified twice in address", input)
-	}
-
 	// error if scheme and port combination violate convention
-	if (u.Scheme == "http" && port == HTTPSPort) || (u.Scheme == "https" && port == HTTPPort) {
+	if (u.Scheme == "http" && port == httpsPort) || (u.Scheme == "https" && port == httpPort) {
 		return Address{}, fmt.Errorf("[%s] scheme and port violate convention", input)
 	}
 
 	// standardize http and https ports to their respective port numbers
-	if port == "http" {
-		u.Scheme = "http"
-		port = HTTPPort
-	} else if port == "https" {
-		u.Scheme = "https"
-		port = HTTPSPort
+	// (this behavior changed in Go 1.12.8)
+	if u.Scheme == "" {
+		if port == httpPort {
+			u.Scheme = "http"
+		} else if port == httpsPort {
+			u.Scheme = "https"
+		}
 	}
 
-	return Address{Original: input, Scheme: u.Scheme, Host: host, Port: port, Path: u.Path}, err
+	return Address{Original: input, Scheme: u.Scheme, Host: host, Port: port, Path: u.Path}, nil
 }
 
 // RegisterDevDirective splices name into the list of directives
@@ -485,6 +636,7 @@ var directives = []string{
 	"startup",  // TODO: Deprecate this directive
 	"shutdown", // TODO: Deprecate this directive
 	"on",
+	"supervisor", // github.com/lucaslorentz/caddy-supervisor
 	"request_id",
 	"realip", // github.com/captncraig/caddy-realip
 	"git",    // github.com/abiosoft/caddy-git
@@ -498,29 +650,33 @@ var directives = []string{
 	"cache", // github.com/nicolasazrak/caddy-cache
 	"rewrite",
 	"ext",
+	"minify", // github.com/hacdias/caddy-minify
 	"gzip",
 	"header",
+	"geoip", // github.com/kodnaplakal/caddy-geoip
 	"errors",
 	"authz",        // github.com/casbin/caddy-authz
 	"filter",       // github.com/echocat/caddy-filter
-	"minify",       // github.com/hacdias/caddy-minify
 	"ipfilter",     // github.com/pyed/ipfilter
 	"ratelimit",    // github.com/xuqingfeng/caddy-rate-limit
-	"search",       // github.com/pedronasser/caddy-search
+	"recaptcha",    // github.com/defund/caddy-recaptcha
 	"expires",      // github.com/epicagency/caddy-expires
 	"forwardproxy", // github.com/caddyserver/forwardproxy
 	"basicauth",
 	"redir",
 	"status",
-	"cors",   // github.com/captncraig/cors/caddy
-	"nobots", // github.com/Xumeiquer/nobots
+	"cors",      // github.com/captncraig/cors/caddy
+	"s3browser", // github.com/techknowlogick/caddy-s3browser
+	"nobots",    // github.com/Xumeiquer/nobots
 	"mime",
-	"login",     // github.com/tarent/loginsrv/caddy
-	"reauth",    // github.com/freman/caddy-reauth
-	"jwt",       // github.com/BTBurke/caddy-jwt
-	"jsonp",     // github.com/pschlump/caddy-jsonp
-	"upload",    // blitznote.com/src/caddy.upload
-	"multipass", // github.com/namsral/multipass/caddy
+	"login",      // github.com/tarent/loginsrv/caddy
+	"reauth",     // github.com/freman/caddy-reauth
+	"extauth",    // github.com/BTBurke/caddy-extauth
+	"jwt",        // github.com/BTBurke/caddy-jwt
+	"permission", // github.com/dhaavi/caddy-permission
+	"jsonp",      // github.com/pschlump/caddy-jsonp
+	"upload",     // blitznote.com/src/caddy.upload
+	"multipass",  // github.com/namsral/multipass/caddy
 	"internal",
 	"pprof",
 	"expvar",
@@ -529,21 +685,22 @@ var directives = []string{
 	"prometheus", // github.com/miekg/caddy-prometheus
 	"templates",
 	"proxy",
+	"pubsub", // github.com/jung-kurt/caddy-pubsub
 	"fastcgi",
 	"cgi", // github.com/jung-kurt/caddy-cgi
 	"websocket",
-	"filemanager", // github.com/hacdias/filemanager/caddy/filemanager
+	"filebrowser", // github.com/filebrowser/caddy
 	"webdav",      // github.com/hacdias/caddy-webdav
 	"markdown",
 	"browse",
-	"jekyll",    // github.com/hacdias/filemanager/caddy/jekyll
-	"hugo",      // github.com/hacdias/filemanager/caddy/hugo
 	"mailout",   // github.com/SchumacherFM/mailout
 	"awses",     // github.com/miquella/caddy-awses
 	"awslambda", // github.com/coopernurse/caddy-awslambda
 	"grpc",      // github.com/pieterlouw/caddy-grpc
 	"gopkg",     // github.com/zikes/gopkg
 	"restic",    // github.com/restic/caddy
+	"wkd",       // github.com/emersion/caddy-wkd
+	"dyndns",    // github.com/linkonoid/caddy-dyndns
 }
 
 const (
@@ -579,10 +736,4 @@ var (
 
 	// QUIC indicates whether QUIC is enabled or not.
 	QUIC bool
-
-	// HTTPPort is the port to use for HTTP.
-	HTTPPort = DefaultHTTPPort
-
-	// HTTPSPort is the port to use for HTTPS.
-	HTTPSPort = DefaultHTTPSPort
 )

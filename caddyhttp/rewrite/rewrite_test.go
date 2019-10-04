@@ -17,21 +17,23 @@ package rewrite
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/mholt/caddy/caddyhttp/httpserver"
+	"github.com/caddyserver/caddy/caddyhttp/httpserver"
 )
 
 func TestRewrite(t *testing.T) {
 	rw := Rewrite{
 		Next: httpserver.HandlerFunc(urlPrinter),
 		Rules: []httpserver.HandlerConfig{
-			NewSimpleRule("/from", "/to"),
-			NewSimpleRule("/a", "/b"),
-			NewSimpleRule("/b", "/b{uri}"),
+			newSimpleRule(t, "^/from$", "/to"),
+			newSimpleRule(t, "^/a$", "/b"),
+			newSimpleRule(t, "^/b$", "/b{uri}"),
+			newSimpleRule(t, "^/simplereggrp/([0-9]+)([a-z]*)$", "/{1}/{2}/{query}"),
 		},
 		FileSys: http.Dir("."),
 	}
@@ -112,6 +114,7 @@ func TestRewrite(t *testing.T) {
 		{"/hashtest/a%20%23%20test", "/a%20%23%20test"},
 		{"/hashtest/a%20%3F%20test", "/a%20%3F%20test"},
 		{"/hashtest/a%20%3F%23test", "/a%20%3F%23test"},
+		{"/simplereggrp/123abc?q", "/123/abc/q?q"},
 	}
 
 	for i, test := range tests {
@@ -123,7 +126,50 @@ func TestRewrite(t *testing.T) {
 		req = req.WithContext(ctx)
 
 		rec := httptest.NewRecorder()
-		rw.ServeHTTP(rec, req)
+		if _, err := rw.ServeHTTP(rec, req); err != nil {
+			log.Println("[ERROR] failed to serve HTTP: ", err)
+		}
+
+		if got, want := rec.Body.String(), test.expectedTo; got != want {
+			t.Errorf("Test %d: Expected URL '%s' to be rewritten to '%s' but was rewritten to '%s'", i, test.from, want, got)
+		}
+	}
+}
+
+// TestWordpress is a test for wordpress usecase.
+func TestWordpress(t *testing.T) {
+	rw := Rewrite{
+		Next: httpserver.HandlerFunc(urlPrinter),
+		Rules: []httpserver.HandlerConfig{
+			// both rules are same, thanks to Go regexp (confusion).
+			newSimpleRule(t, "^/wp-admin", "{path} {path}/ /index.php?{query}", true),
+			newSimpleRule(t, "^\\/wp-admin", "{path} {path}/ /index.php?{query}", true),
+		},
+		FileSys: http.Dir("."),
+	}
+	tests := []struct {
+		from       string
+		expectedTo string
+	}{
+		{"/wp-admin", "/wp-admin"},
+		{"/wp-admin/login.php", "/wp-admin/login.php"},
+		{"/not-wp-admin/login.php?not=admin", "/index.php?not=admin"},
+		{"/loophole", "/index.php"},
+		{"/user?name=john", "/index.php?name=john"},
+	}
+
+	for i, test := range tests {
+		req, err := http.NewRequest("GET", test.from, nil)
+		if err != nil {
+			t.Fatalf("Test %d: Could not create HTTP request: %v", i, err)
+		}
+		ctx := context.WithValue(req.Context(), httpserver.OriginalURLCtxKey, *req.URL)
+		req = req.WithContext(ctx)
+
+		rec := httptest.NewRecorder()
+		if _, err := rw.ServeHTTP(rec, req); err != nil {
+			log.Println("[ERROR] failed to serve HTTP: ", err)
+		}
 
 		if got, want := rec.Body.String(), test.expectedTo; got != want {
 			t.Errorf("Test %d: Expected URL to be '%s' but was '%s'", i, want, got)
@@ -132,6 +178,6 @@ func TestRewrite(t *testing.T) {
 }
 
 func urlPrinter(w http.ResponseWriter, r *http.Request) (int, error) {
-	fmt.Fprint(w, r.URL.String())
+	_, _ = fmt.Fprint(w, r.URL.String())
 	return 0, nil
 }

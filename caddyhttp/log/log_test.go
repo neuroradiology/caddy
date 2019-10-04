@@ -17,12 +17,13 @@ package log
 import (
 	"bytes"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/mholt/caddy/caddyhttp/httpserver"
+	"github.com/caddyserver/caddy/caddyhttp/httpserver"
 )
 
 type erroringMiddleware struct{}
@@ -89,7 +90,9 @@ func TestLogRequestBody(t *testing.T) {
 		}},
 		Next: httpserver.HandlerFunc(func(w http.ResponseWriter, r *http.Request) (int, error) {
 			// drain up body
-			ioutil.ReadAll(r.Body)
+			if _, err := ioutil.ReadAll(r.Body); err != nil {
+				log.Println("[ERROR] failed to read request body: ", err)
+			}
 			return 0, nil
 		}),
 	}
@@ -153,7 +156,9 @@ func TestMultiEntries(t *testing.T) {
 		}},
 		Next: httpserver.HandlerFunc(func(w http.ResponseWriter, r *http.Request) (int, error) {
 			// drain up body
-			ioutil.ReadAll(r.Body)
+			if _, err := ioutil.ReadAll(r.Body); err != nil {
+				log.Println("[ERROR] failed to read request body: ", err)
+			}
 			return 0, nil
 		}),
 	}
@@ -175,5 +180,87 @@ func TestMultiEntries(t *testing.T) {
 	}
 	if got, expect := got2.String(), "POST hello world\n"; got != expect {
 		t.Errorf("Expected %q, but got %q", expect, got)
+	}
+}
+
+func TestLogExcept(t *testing.T) {
+	tests := []struct {
+		LogRules  []Rule
+		logPath   string
+		shouldLog bool
+	}{
+		{[]Rule{{
+			PathScope: "/",
+			Entries: []*Entry{{
+				Log: &httpserver.Logger{
+
+					Exceptions: []string{"/soup"},
+				},
+				Format: DefaultLogFormat,
+			}},
+		}}, `/soup`, false},
+		{[]Rule{{
+			PathScope: "/",
+			Entries: []*Entry{{
+				Log: &httpserver.Logger{
+
+					Exceptions: []string{"/tart"},
+				},
+				Format: DefaultLogFormat,
+			}},
+		}}, `/soup`, true},
+		{[]Rule{{
+			PathScope: "/",
+			Entries: []*Entry{{
+				Log: &httpserver.Logger{
+
+					Exceptions: []string{"/soup"},
+				},
+				Format: DefaultLogFormat,
+			}},
+		}}, `/tomatosoup`, true},
+		{[]Rule{{
+			PathScope: "/",
+			Entries: []*Entry{{
+				Log: &httpserver.Logger{
+
+					Exceptions: []string{"/pie/"},
+				},
+				Format: DefaultLogFormat,
+			}},
+			// Check exception with a trailing slash does not match without
+		}}, `/pie`, true},
+		{[]Rule{{
+			PathScope: "/",
+			Entries: []*Entry{{
+				Log: &httpserver.Logger{
+
+					Exceptions: []string{"/pie.php"},
+				},
+				Format: DefaultLogFormat,
+			}},
+		}}, `/pie`, true},
+		{[]Rule{{
+			PathScope: "/",
+			Entries: []*Entry{{
+				Log: &httpserver.Logger{
+
+					Exceptions: []string{"/pie"},
+				},
+				Format: DefaultLogFormat,
+			}},
+			// Check that a word without trailing slash will match a filename
+		}}, `/pie.php`, false},
+	}
+	for i, test := range tests {
+		for _, LogRule := range test.LogRules {
+			for _, e := range LogRule.Entries {
+				shouldLog := e.Log.ShouldLog(test.logPath)
+				if shouldLog != test.shouldLog {
+					t.Fatalf("Test  %d expected shouldLog=%t but got shouldLog=%t,", i, test.shouldLog, shouldLog)
+				}
+			}
+		}
+
 	}
 }
